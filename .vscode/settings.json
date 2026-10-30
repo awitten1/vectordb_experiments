@@ -1,0 +1,8 @@
+{
+  // Use clangd for IntelliSense; keep the Microsoft C/C++ extension for debugging only
+  "C_Cpp.intelliSenseEngine": "disabled",
+  "clangd.arguments": [
+    // Don't auto-insert #includes on completion
+    "--header-insertion=never"
+  ]
+}

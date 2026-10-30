@@ -1,0 +1,4 @@
+-xc
+-std=gnu99
+-Ipostgres/source/build/src/include
+-Ipostgres/source/src/include
