@@ -4,6 +4,13 @@
 set -euo pipefail
 
 PG_VERSION="${PG_VERSION:-17.11}"
+# FRAME_POINTERS=1 builds with frame pointers so `perf record --call-graph fp`
+# gets complete stacks (costs ~1-2% throughput). Re-run without it to switch back.
+FRAME_POINTERS="${FRAME_POINTERS:-0}"
+FP_FLAGS=""
+if [ "$FRAME_POINTERS" = 1 ]; then
+  FP_FLAGS="-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer"
+fi
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SRC="$ROOT/postgres/source"
@@ -45,12 +52,16 @@ fi
 if [ ! -d "$BUILD" ]; then
   meson setup "$BUILD" "$SRC" --prefix="$PREFIX" -Dicu=disabled
 fi
+# Applied on every run so FRAME_POINTERS can be toggled; ninja rebuilds if it changed
+meson configure "$BUILD" -Dc_args="$FP_FLAGS"
 ninja -C "$BUILD"
 ninja -C "$BUILD" install
 
 # 3. Build and install pgvector into that Postgres
 cd "$ROOT/pgvector"
-make -j"$JOBS" PG_CONFIG="$PREFIX/bin/pg_config"
+# make doesn't track flag changes, so always rebuild from clean (pgvector is small)
+make clean PG_CONFIG="$PREFIX/bin/pg_config" >/dev/null
+make -j"$JOBS" PG_CONFIG="$PREFIX/bin/pg_config" OPTFLAGS="-march=native $FP_FLAGS"
 make install PG_CONFIG="$PREFIX/bin/pg_config"
 
 echo "Done. Postgres binaries are in $PREFIX/bin"

@@ -2,3 +2,5 @@
 data/
 results/
 __pycache__/
+profiles/
+.tools/

@@ -70,6 +70,26 @@ make -C pgvector install PG_CONFIG=$PWD/postgres/install/bin/pg_config
 $P bench/ann_bench.py --dataset sift-128-euclidean --index hnsw --rebuild
 ```
 
+## Profiling (perf + flamegraph)
+
+`bench/profile.sh` takes the same arguments as `ann_bench.py`. It does the following:
+- prewarms the benchmark tables and indexes, and fails unless every block is in
+  `shared_buffers`
+- runs the benchmark under `perf record`, attached to the postmaster so the query
+  backend is profiled and the Python client is not
+- writes the profile, residency check and flamegraph to `bench/profiles/<NAME>.*`
+
+```sh
+sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0   # resets on reboot
+FRAME_POINTERS=1 ./build_postgres.sh     # complete call stacks; DWARF unwinding recovered only ~25%
+PGPORT=5433 NAME=sift-hnsw-ef40 bench/profile.sh \
+    --dataset sift-128-euclidean --index hnsw --sweep 40 --num-queries 10000
+```
+
+The flamegraph uses Brendan Gregg's FlameGraph scripts, cloned at a pinned commit
+into `bench/.tools/`. Other environment knobs: `PERF_FREQ` (default 999),
+`PERF_CALLGRAPH` (default `fp`), and `FLAMEGRAPH=0` to record only.
+
 Notes:
 - Latency is measured client-side around each `execute` + `fetchall` and includes the
   network round trip over localhost. Queries use protocol-level prepared statements.
