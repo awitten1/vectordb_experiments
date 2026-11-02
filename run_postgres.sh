@@ -2,6 +2,7 @@
 # Start (or stop) the Postgres built by build_postgres.sh, with pgvector enabled.
 # Usage: ./run_postgres.sh [start|stop]
 # Data lives in ./postgres/data; logs go to ./postgres/data/log
+# Env: PGPORT (default 5432); PG_OPTS extra server options, e.g. PG_OPTS="-c shared_buffers=8GB"
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -23,7 +24,7 @@ case "${1:-start}" in
     if "$BIN/pg_ctl" -D "$DATA" status >/dev/null; then
       echo "Postgres is already running"
     else
-      "$BIN/pg_ctl" -D "$DATA" -l "$DATA/log" -o "-p $PORT -c listen_addresses=localhost" -w start
+      "$BIN/pg_ctl" -D "$DATA" -l "$DATA/log" -o "-p $PORT -c listen_addresses=localhost ${PG_OPTS:-}" -w start
     fi
     "$BIN/psql" -h localhost -p "$PORT" -U postgres -d postgres -qc "SET client_min_messages = warning; CREATE EXTENSION IF NOT EXISTS vector"
     echo "Connect with: $BIN/psql \"host=localhost port=$PORT user=postgres dbname=postgres\""
