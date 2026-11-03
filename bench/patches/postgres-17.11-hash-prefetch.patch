@@ -1,0 +1,76 @@
+--- a/src/backend/utils/hash/dynahash.c
++++ b/src/backend/utils/hash/dynahash.c
+@@ -1735,6 +1735,30 @@
+ 	return bucket;
+ }
+ 
++/*
++ * hash_prefetch -- bring the bucket a hash value maps to into cache
++ *
++ * For a large shared table such as the buffer mapping table, the bucket
++ * lookup is a dependent cache miss: nothing else can issue until the bucket
++ * header arrives. A caller that knows several hash values up front can call
++ * this for all of them first, so the misses overlap instead of serializing.
++ *
++ * This only touches memory, so a stale or concurrently-modified bucket is
++ * harmless and no lock is needed.
++ */
++void
++hash_prefetch(HTAB *hashp, uint32 hashvalue)
++{
++#ifdef USE_PREFETCH
++	HASHHDR    *hctl = hashp->hctl;
++	uint32		bucket = calc_bucket(hctl, hashvalue);
++	HASHSEGMENT segp = hashp->dir[bucket >> hashp->sshift];
++
++	if (segp != NULL)
++		__builtin_prefetch(&segp[MOD(bucket, hashp->ssize)]);
++#endif
++}
++
+ /* complain when we have detected a corrupted hashtable */
+ static void
+ hash_corrupted(HTAB *hashp)
+--- a/src/include/utils/hsearch.h
++++ b/src/include/utils/hsearch.h
+@@ -140,6 +140,7 @@
+ extern bool hash_update_hash_key(HTAB *hashp, void *existingEntry,
+ 								 const void *newKeyPtr);
+ extern long hash_get_num_entries(HTAB *hashp);
++extern void hash_prefetch(HTAB *hashp, uint32 hashvalue);
+ extern void hash_seq_init(HASH_SEQ_STATUS *status, HTAB *hashp);
+ extern void *hash_seq_search(HASH_SEQ_STATUS *status);
+ extern void hash_seq_term(HASH_SEQ_STATUS *status);
+--- a/src/backend/storage/buffer/buf_table.c
++++ b/src/backend/storage/buffer/buf_table.c
+@@ -81,6 +81,20 @@
+ }
+ 
+ /*
++ * BufTablePrefetch
++ *		Start fetching the hash bucket for a tag's hashcode into cache.
++ *
++ * Intended for callers that are about to look up several blocks whose
++ * hashcodes they already know, so the bucket misses overlap. No lock is
++ * required: this only touches memory and ignores what it finds.
++ */
++void
++BufTablePrefetch(uint32 hashcode)
++{
++	hash_prefetch(SharedBufHash, hashcode);
++}
++
++/*
+  * BufTableLookup
+  *		Lookup the given BufferTag; return buffer ID, or -1 if not found
+  *
+--- a/src/include/storage/buf_internals.h
++++ b/src/include/storage/buf_internals.h
+@@ -438,6 +438,7 @@
+ extern Size BufTableShmemSize(int size);
+ extern void InitBufTable(int size);
+ extern uint32 BufTableHashCode(BufferTag *tagPtr);
++extern void BufTablePrefetch(uint32 hashcode);
+ extern int	BufTableLookup(BufferTag *tagPtr, uint32 hashcode);
+ extern int	BufTableInsert(BufferTag *tagPtr, uint32 hashcode, int buf_id);
+ extern void BufTableDelete(BufferTag *tagPtr, uint32 hashcode);

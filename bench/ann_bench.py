@@ -61,6 +61,7 @@ def main() -> None:
         "num_queries": len(test),
         "k": args.k,
         "clients": args.clients,
+        "duration_s": args.duration or None,
         "index": args.index,
         "build_params": build_params(args, len(ds.train)),
         **build,
@@ -77,9 +78,10 @@ def main() -> None:
     for value in sweep:
         if args.index == "hnsw" and value < args.k:
             log(f"warning: ef_search={value} < k={args.k}; HNSW returns at most ef_search rows")
-        ids, latencies_ns, wall_ns = run_queries(args.dsn, ds, test, args.k, guc, value, args.clients)
+        ids, latencies_ns, wall_ns, executed = run_queries(
+            args.dsn, ds, test, args.k, guc, value, args.clients, args.duration)
         result = {**meta, "search_param": guc, "search_value": value if guc else None,
-                  **summarize(ids, neighbors, args.k, latencies_ns, wall_ns)}
+                  **summarize(ids, neighbors, args.k, latencies_ns, wall_ns, executed)}
         rows.append(result)
         print_row(result)
 
@@ -114,6 +116,10 @@ def parse_args() -> argparse.Namespace:
 
     r = p.add_argument_group("run")
     r.add_argument("--clients", type=int, default=1, help="concurrent connections issuing queries (default: 1)")
+    r.add_argument("--duration", type=float, default=0.0,
+                   help="seconds to keep issuing queries per sweep point, cycling the query set "
+                        "(default: 0, meaning one pass). Use this for throughput numbers: a single "
+                        "pass over 10k queries is only a few seconds at high client counts")
     r.add_argument("--num-queries", type=int, default=1000,
                    help="queries to run; also the synthetic query set size (default: 1000)")
     r.add_argument("--seed", type=int, default=42, help="seed for synthetic data (default: 42)")
@@ -253,15 +259,23 @@ def check_plan(conn, ds, args, index_name, query_vec) -> None:
 # --- queries -----------------------------------------------------------------
 
 
-def run_queries(dsn, ds, test, k, guc, value, clients):
-    """Run every test query, split across `clients` connections.
+def run_queries(dsn, ds, test, k, guc, value, clients, duration=0.0):
+    """Run the test queries, split across `clients` connections.
+
+    With duration=0 each query runs exactly once. With duration > 0 every
+    worker keeps cycling its slice until that many seconds have elapsed, which
+    is how you get a measurement window that does not depend on the size of the
+    query set: at 8 clients a 10k-query single pass is only ~3s of wall clock,
+    too short for startup costs to amortize or for outliers to average out.
+    Repeated passes re-issue identical queries, so recall is unaffected.
 
     Returns (result ids [q, k] padded with -1, per-query latencies in ns,
-    wall time in ns from the first query start to the last query end).
+    wall time in ns from the first query start to the last query end, and the
+    total number of queries executed).
     """
     query = f"SELECT id FROM {ident(ds.table)} ORDER BY embedding {ds.operator} %s LIMIT {k}"
     slices = np.array_split(np.arange(len(test)), clients)
-    jobs = [(dsn, query, guc, value, k, test[s]) for s in slices]
+    jobs = [(dsn, query, guc, value, k, test[s], duration) for s in slices]
 
     if clients == 1:
         outputs = [query_worker(*jobs[0])]
@@ -275,12 +289,13 @@ def run_queries(dsn, ds, test, k, guc, value, clients):
     ids = np.concatenate([o[0] for o in outputs])
     latencies = np.concatenate([o[1] for o in outputs])
     wall = max(o[3] for o in outputs) - min(o[2] for o in outputs)
-    return ids, latencies, wall
+    executed = sum(len(o[1]) for o in outputs)
+    return ids, latencies, wall, executed
 
 
-def query_worker(dsn, query, guc, value, k, vectors, barrier=None):
+def query_worker(dsn, query, guc, value, k, vectors, duration=0.0, barrier=None):
     ids = np.full((len(vectors), k), -1, dtype=np.int64)
-    latencies = np.empty(len(vectors), dtype=np.int64)
+    latencies = []
     with connect(dsn) as conn, conn.cursor() as cur:
         if guc:
             conn.execute(f"SET {guc} = {int(value)}")
@@ -290,23 +305,38 @@ def query_worker(dsn, query, guc, value, k, vectors, barrier=None):
             barrier.wait()
         # monotonic_ns is system-wide on Linux, so starts/ends compare across workers
         start = time.monotonic_ns()
-        for i, vec in enumerate(vectors):
-            t0 = time.perf_counter_ns()
-            cur.execute(query, (vec,), prepare=True)
-            rows = cur.fetchall()
-            latencies[i] = time.perf_counter_ns() - t0
-            ids[i, : len(rows)] = [r[0] for r in rows]
+        deadline = start + int(duration * 1e9) if duration else 0
+        while True:
+            for i, vec in enumerate(vectors):
+                t0 = time.perf_counter_ns()
+                cur.execute(query, (vec,), prepare=True)
+                rows = cur.fetchall()
+                latencies.append(time.perf_counter_ns() - t0)
+                # ids is overwritten on every pass; the queries are identical,
+                # so the last pass is as good as the first for recall
+                ids[i, : len(rows)] = [r[0] for r in rows]
+                if deadline and time.monotonic_ns() >= deadline:
+                    break
+            else:
+                if not deadline:
+                    break
+                continue
+            break
         end = time.monotonic_ns()
-    return ids, latencies, start, end
+    return ids, np.asarray(latencies, dtype=np.int64), start, end
 
 
-def summarize(ids, neighbors, k, latencies_ns, wall_ns) -> dict:
+def summarize(ids, neighbors, k, latencies_ns, wall_ns, executed=None) -> dict:
     truth = neighbors[:, :k]
     hits = sum(len(np.intersect1d(ids[i], truth[i])) for i in range(len(ids)))
     ms = latencies_ns / 1e6
+    # recall is over the distinct query set; QPS is over everything executed,
+    # which differs from it once --duration makes workers cycle their slice
+    n_exec = len(latencies_ns) if executed is None else executed
     return {
         "recall": round(hits / (len(ids) * k), 5),
-        "qps": round(len(ids) / (wall_ns / 1e9), 2),
+        "qps": round(n_exec / (wall_ns / 1e9), 2),
+        "queries_executed": n_exec,
         "latency_ms": {
             "mean": round(float(ms.mean()), 4),
             "p50": round(float(np.percentile(ms, 50)), 4),

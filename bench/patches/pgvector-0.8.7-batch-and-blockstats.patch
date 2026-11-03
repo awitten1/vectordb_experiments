@@ -1,0 +1,211 @@
+diff --git a/src/hnswutils.c b/src/hnswutils.c
+index 8e6ac2a..dc78d79 100644
+--- a/src/hnswutils.c
++++ b/src/hnswutils.c
+@@ -532,6 +532,113 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
+ 	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
+ }
+ 
++/*
++ * A pinned, share-locked index page held across several element loads.
++ *
++ * Expanding one candidate loads up to 2 * m neighbor elements. Each one used
++ * to be a separate ReadBuffer, and profiling showed BufTableLookup (the buffer
++ * mapping hash probe) at ~38% of query CPU with 99% of it on this path, versus
++ * 0.8% for the actual distance arithmetic. Sorting the neighbors by block and
++ * holding one buffer across a run of same-block neighbors collapses those
++ * repeats into a single lookup and pin.
++ */
++typedef struct HnswPageCursor
++{
++	Relation	index;
++	BlockNumber blkno;			/* InvalidBlockNumber when nothing is held */
++	Buffer		buf;
++	Page		page;
++}			HnswPageCursor;
++
++static inline void
++HnswPageCursorInit(HnswPageCursor * cur, Relation index)
++{
++	cur->index = index;
++	cur->blkno = InvalidBlockNumber;
++	cur->buf = InvalidBuffer;
++	cur->page = NULL;
++}
++
++static inline void
++HnswPageCursorRelease(HnswPageCursor * cur)
++{
++	if (cur->blkno != InvalidBlockNumber)
++	{
++		UnlockReleaseBuffer(cur->buf);
++		cur->blkno = InvalidBlockNumber;
++		cur->buf = InvalidBuffer;
++		cur->page = NULL;
++	}
++}
++
++/*
++ * Make blkno the cursor's current page, reusing the pin when it already is.
++ */
++static inline Page
++HnswPageCursorGet(HnswPageCursor * cur, BlockNumber blkno)
++{
++	if (cur->blkno == blkno)
++		return cur->page;
++
++#ifdef HNSW_BLOCKSTATS
++	{
++		/* would a ReadRecentBuffer-style cache have hit here? */
++		static BlockNumber recent[256];
++		static int64 probes = 0, hits = 0;
++		int			slot = blkno & 255;
++
++		probes++;
++		if (recent[slot] == blkno)
++			hits++;
++		recent[slot] = blkno;
++		if (probes % 5000000 == 0)
++			elog(LOG, "hnsw recentcache: %ld probes, %ld hits (%.4f%% hit rate)",
++				 probes, hits, 100.0 * hits / probes);
++	}
++#endif
++
++	HnswPageCursorRelease(cur);
++
++	cur->buf = ReadBuffer(cur->index, blkno);
++	LockBuffer(cur->buf, BUFFER_LOCK_SHARE);
++	cur->blkno = blkno;
++	cur->page = BufferGetPage(cur->buf);
++
++	return cur->page;
++}
++
++/*
++ * Load an element through a page cursor, leaving the page pinned for the next
++ * caller. Same semantics as HnswLoadElementImpl otherwise.
++ */
++static void
++HnswLoadElementViaCursor(HnswPageCursor * cur, BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
++{
++	Page		page = HnswPageCursorGet(cur, blkno);
++	HnswElementTuple etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
++
++	Assert(HnswIsElementTuple(etup));
++
++	if (unlikely(etup->deleted))
++		elog(ERROR, "cannot load deleted element");
++
++	if (distance != NULL)
++	{
++		if (DatumGetPointer(q->value) == NULL)
++			*distance = 0;
++		else
++			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
++	}
++
++	if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
++	{
++		if (*element == NULL)
++			*element = HnswInitElementFromBlock(blkno, offno);
++
++		HnswLoadElementFromTuple(*element, etup, true, loadVec);
++	}
++}
++
+ /*
+  * Load an element and optionally get its distance from q
+  */
+@@ -819,6 +926,60 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
+ 		if (!found)
+ 			unvisited[(*unvisitedLength)++].indextid = *indextid;
+ 	}
++
++	/*
++	 * Sort by block so the caller's page cursor sees same-page neighbors back
++	 * to back and reads each distinct page once. Insertion sort: this array
++	 * holds at most 2 * m entries and is usually nearly sorted already, since
++	 * the build writes neighboring elements out together.
++	 *
++	 * Reordering is safe. W keeps the ef nearest elements seen and its
++	 * threshold only tightens, so an element skipped by the maxDistance test
++	 * could not have made the final result in any other order; C is a priority
++	 * queue, so pop order does not depend on insertion order either.
++	 */
++#ifdef HNSW_BLOCKSTATS
++	{
++		static int64 expansions = 0, neighbors = 0, distinct = 0;
++		BlockNumber seen[HNSW_MAX_M * 2];
++		int			nseen = 0;
++
++		for (int i = 0; i < *unvisitedLength; i++)
++		{
++			BlockNumber b = ItemPointerGetBlockNumber(&unvisited[i].indextid);
++			bool		dup = false;
++
++			for (int j = 0; j < nseen; j++)
++				if (seen[j] == b)
++				{
++					dup = true;
++					break;
++				}
++			if (!dup)
++				seen[nseen++] = b;
++		}
++		expansions++;
++		neighbors += *unvisitedLength;
++		distinct += nseen;
++		if (expansions % 200000 == 0)
++			elog(LOG, "hnsw blockstats: %ld expansions, %ld neighbors, %ld distinct blocks (%.3f neighbors/block)",
++				 expansions, neighbors, distinct, distinct ? (double) neighbors / distinct : 0);
++	}
++#endif
++
++	for (int i = 1; i < *unvisitedLength; i++)
++	{
++		HnswUnvisited hold = unvisited[i];
++		BlockNumber holdBlk = ItemPointerGetBlockNumber(&hold.indextid);
++		int			j = i - 1;
++
++		while (j >= 0 && ItemPointerGetBlockNumber(&unvisited[j].indextid) > holdBlk)
++		{
++			unvisited[j + 1] = unvisited[j];
++			j--;
++		}
++		unvisited[j + 1] = hold;
++	}
+ }
+ 
+ /*
+@@ -839,6 +1000,9 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 	HnswUnvisited *unvisited = palloc_array_checked(HnswUnvisited, lm);
+ 	int			unvisitedLength;
+ 	bool		inMemory = index == NULL;
++	HnswPageCursor cursor;
++
++	HnswPageCursorInit(&cursor, index);
+ 
+ 	if (v == NULL)
+ 	{
+@@ -930,7 +1094,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 
+ 				/* Avoid any allocations if not adding */
+ 				eElement = NULL;
+-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
++				HnswLoadElementViaCursor(&cursor, blkno, offno, &eDistance, q, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+ 
+ 				if (eElement == NULL)
+ 					continue;
+@@ -976,6 +1140,12 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 				}
+ 			}
+ 		}
++
++		/*
++		 * Done with this candidate's neighbors; do not hold a pin or a share
++		 * lock across the next iteration, which reads a neighbor tuple.
++		 */
++		HnswPageCursorRelease(&cursor);
+ 	}
+ 
+ 	/* Add each element of W to w */
