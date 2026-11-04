@@ -3,6 +3,9 @@
 Measures recall@k vs. QPS / latency for pgvector's HNSW and IVFFlat indexes,
 against the Postgres built by `../build_postgres.sh`.
 
+`FINDINGS.md` holds the 18M-vector BIGANN results and the buffer-manager
+investigation; `REPORT.md` is the older SIFT-1M report.
+
 ## Setup
 
 ```sh
