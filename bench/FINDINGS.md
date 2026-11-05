@@ -50,9 +50,11 @@ the allocation, so check `repquota` and not just `df`. `sysv` is governed by
 `bench/run_experiment.sh` now runs a `shmget` preflight before the build and
 refuses to proceed with `mmap`.
 
-## Query performance
+## Query performance (HNSW, PostgreSQL 17.11)
 
-Single client, 60 s per point, warm backend, stock pgvector:
+Single client, 60 s per point, warm backend, stock pgvector. Kept as the
+original baseline; the 18.6 re-measurement is in the three-index comparison
+below and agrees with it.
 
 | ef_search | recall@10 | QPS | µs/query |
 |---:|---:|---:|---:|
@@ -302,7 +304,7 @@ existing cluster. Recompile Postgres and pgvector, fresh `initdb`, reload,
 rebuild (~2–3 h wall clock), and WAL full-page writes get 4× bigger. Should be
 done in a **second `PGDATA`** so the 8 KiB cluster survives as a warm baseline.
 
-## PRISM (pg_vectorsearch) against HNSW, same table
+## PRISM, HNSW and IVFFlat on the same 18M vectors
 
 `pg_vectorsearch` 0.2.0-dev (`753e3e74`) builds a PRISM index — IVF-style, with
 a hierarchical centroid tree, RaBitQ-quantized posting lists, and two-stage
@@ -316,13 +318,18 @@ for operator classes.
 
 ### Build and size
 
-| | HNSW (m=16, efc=64) | PRISM (all auto) |
-|---|---:|---:|
-| build | 1,811 s | **170 s** |
-| size | 14 GB / 1,828,406 blk | **1,345 MB / 172,163 blk** |
-| peak build DSM | the whole graph | **26.7 MB** |
+| | HNSW (m=16, efc=64) | PRISM (all auto) | IVFFlat (lists=4242) |
+|---|---:|---:|---:|
+| build | 1,811 s, 23 workers | **170 s**, 23 workers | ~15 min, **1 worker** |
+| size | 14 GB / 1,828,406 blk | **1,345 MB / 172,163 blk** | 9,393 MB / 1,202,279 blk |
+| peak build DSM | the whole graph | **26.7 MB** | n/a |
 
-Both ratios are 10.7x, coincidentally. Resolved settings: `nlist=26569`,
+HNSW vs PRISM on build and size is 10.7x both ways, coincidentally. The IVFFlat
+build time is **not comparable**: it ran single-threaded despite
+`max_parallel_maintenance_workers=23`, and the exact figure was lost when the
+build's progress output overwrote the line in the log (~55% of tuples at the
+8-minute mark, hence the estimate). Worth chasing; pgvector does support
+parallel IVFFlat builds. Resolved settings: `nlist=26569`,
 `fan_out=163`, `nlevels=2`, `centroid_format=fastscan`, auto `nprobe=82`.
 
 Build phases: k-means 64.2 s (root 31.7 + subtrees 32.5), parallel table scan
@@ -340,7 +347,7 @@ That is where the posting pages go, and it is what buys recall at a given
 
 ### Recall vs throughput
 
-![recall vs QPS](report/bigann-18000000-hnsw-prism-recall-qps.svg)
+![recall vs QPS](report/bigann-18000000-hnsw-prism-ivfflat-recall-qps.svg)
 
 Single client, 60 s per point, index fully resident, PostgreSQL 18.6.
 
@@ -425,6 +432,29 @@ deadline (`--duration 60`) and record `queries_executed`. The first profile's
 page-fault artefact existed because `phase_profile` silently did not forward
 `--duration`.
 
+**A deadline must be a floor on time, not a cap on queries.** The deadline was
+checked after every query, so a point too slow to finish one pass stopped
+mid-way -- leaving rows of the results array unanswered while recall was still
+divided by the whole query set. The reported recall was therefore the true
+recall scaled by the fraction of queries that got through, which looks like a
+plausible number rather than an error:
+
+| ivfflat.probes | QPS | queries in 60s | reported | after the fix |
+|---:|---:|---:|---:|---:|
+| 20 | 36.8 | 2,208 (full) | 0.9097 | 0.9097 |
+| 50 | 15.7 | 930 of 1,000 | 0.9010 | **0.9710** |
+| 100 | 8.3 | 492 of 1,000 | 0.4854 | **0.9905** |
+
+Recall *falling* from probes=20 to 50 is what gave it away; dividing by coverage
+recovered a monotonic curve and predicted the corrected values to within 0.004.
+The deadline is now checked between passes, so at least one full pass always
+runs, and `summarize` hard-errors if any query went unanswered. Points that had
+completed a full pass are unchanged to 4 decimal places, which is the control.
+
+Only IVFFlat was ever affected: every HNSW and PRISM point cleared several full
+passes, the slowest being HNSW at 204 QPS -- 12,240 queries against a 1,000
+query set.
+
 **Other scar tissue:**
 
 - Do not edit a shell script while bash is executing it. Bash reads by byte
@@ -477,5 +507,9 @@ anyone repeating it:
 - Port PRISM's dense block->buffer map to pgvector HNSW (attempt 2, above): no
   core patch needed, and it targets the whole 38%.
 - Why the planner prefers HNSW at default settings when PRISM is 3-5x faster.
+- An IVFFlat `lists` sweep. Everything here is the default `sqrt(rows)`, which
+  gives lists ~6x fatter than PRISM's; `rows/1000` is the obvious comparison.
+- Why the IVFFlat build ran single-threaded, and capturing its build time
+  properly (the progress output overwrote it in the log).
 - Three-pass prefetch to hide the second dynahash miss: not tried.
 - shmem THP / huge pages for `shared_buffers`: not tried, and dTLB miss rate says it could matter.

@@ -66,6 +66,10 @@ class Dataset:
     test: np.ndarray  # float32 [q, d]
     neighbors: np.ndarray  # int [q, >=GT_K], ids are row indexes into train
     metric: str
+    # Use a different table than the dataset's own. Lets a second copy of the
+    # same data carry a different index, so two index types can be measured
+    # without competing for the planner's choice on one table.
+    table_override: str | None = None
 
     @property
     def dim(self) -> int:
@@ -74,6 +78,8 @@ class Dataset:
     @property
     def table(self) -> str:
         """Postgres table name for this dataset."""
+        if self.table_override:
+            return self.table_override
         return "items_" + re.sub(r"[^a-z0-9]+", "_", self.name.lower()).strip("_")
 
     @property

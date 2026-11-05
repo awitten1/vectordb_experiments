@@ -27,8 +27,13 @@ RESULTS_DIR = REPO_ROOT / "bench" / "results"
 # Chart chrome plus categorical slots 1 and 2 from the validated reference
 # palette (blue, orange). Both modes pass all six checks against their own
 # surface; re-check with the dataviz skill's validator before changing a hue:
-#   node scripts/validate_palette.js "#2a78d6,#eb6834" --mode light --surface "#fcfcfb"
-#   node scripts/validate_palette.js "#3987e5,#d95926" --mode dark  --surface "#1a1a19"
+#   node scripts/validate_palette.js "#2a78d6,#eb6834,#1baf7a" --mode light \
+#       --surface "#fcfcfb" --pairs all
+#   node scripts/validate_palette.js "#3987e5,#d95926,#199e70" --mode dark \
+#       --surface "#1a1a19" --pairs all
+# Both pass all-pairs. Light-mode aqua is 2.74:1 against the surface, under the
+# 3:1 bar, so the relief rule applies: every point carries a direct label and
+# bench/FINDINGS.md repeats the numbers as a table.
 TOKENS = {
     "light": {
         "surface": "#fcfcfb",
@@ -39,6 +44,7 @@ TOKENS = {
         "axis": "#c3c2b7",
         "series1": "#2a78d6",
         "series2": "#eb6834",
+        "series3": "#1baf7a",
     },
     "dark": {
         "surface": "#1a1a19",
@@ -49,6 +55,7 @@ TOKENS = {
         "axis": "#383835",
         "series1": "#3987e5",
         "series2": "#d95926",
+        "series3": "#199e70",
     },
 }
 
@@ -184,7 +191,7 @@ def build_svg(series, dataset: str) -> str:
     a('.lgnd{fill:var(--ink);font-size:12.5px;font-weight:500}')
     # Series identity is carried by the legend AND by every point's own label, so
     # it never rests on color alone.
-    for i in (1, 2):
+    for i in (1, 2, 3):
         a(f'.line{i}{{fill:none;stroke:var(--series{i});stroke-width:2;'
           f'stroke-linejoin:round;stroke-linecap:round}}')
         a(f'.dot{i}{{fill:var(--series{i});stroke:var(--surface);stroke-width:2}}')
@@ -194,8 +201,8 @@ def build_svg(series, dataset: str) -> str:
     a("</style>")
 
     a(f'<rect class="bg" x="0" y="0" width="{W}" height="{H}"/>')
-    a(f'<text class="ttl" x="{PAD["l"]}" y="34">Recall vs throughput — {esc(names)}, '
-      f'18M BIGANN (SIFT) vectors</text>')
+    a(f'<text class="ttl" x="{PAD["l"]}" y="34">Recall vs throughput — '
+      f'18M BIGANN (SIFT) vectors, {len(series)} index types</text>')
     a(f'<text class="sub" x="{PAD["l"]}" y="55">{esc(sub)}</text>')
 
     # legend: mandatory for two or more series
@@ -204,7 +211,7 @@ def build_svg(series, dataset: str) -> str:
         st = INDEX_STYLE[s["index"]]
         a(f'<rect class="sw{i}" x="{lx}" y="74" width="22" height="4" rx="2"/>')
         a(f'<circle class="dot{i}" cx="{lx + 11}" cy="76" r="5"/>')
-        label = f'{st["name"]}  ({s["param"]})'
+        label = f'{st["name"]}  ({s["param"].split(".")[-1]})'
         a(f'<text class="lgnd" x="{lx + 32}" y="80">{esc(label)}</text>')
         lx += 32 + 7.1 * len(label) + 34
 
@@ -239,7 +246,7 @@ def build_svg(series, dataset: str) -> str:
             # lower right, so the free quadrants are upper-right and lower-left.
             # Series 1 takes upper-right, series 2 lower-left, which also keeps
             # the two label sets apart where the curves cross.
-            above = (i == 1)
+            above = (i != 2)
             if x > px1 - 64:
                 above = False
             if above:
@@ -260,7 +267,7 @@ def main():
     ap.add_argument("dataset", help="dataset name, e.g. bigann_18000000")
     ap.add_argument("-o", "--out", help="output .svg path")
     ap.add_argument("--index", action="append",
-                    help="index to plot; repeatable (default: hnsw then prism)")
+                    help="index to plot; repeatable (default: hnsw, prism, ivfflat)")
     ap.add_argument("--clients", type=int, default=1)
     ap.add_argument("--window", type=float,
                     help="seconds per sweep point, for results recorded before "
@@ -270,9 +277,11 @@ def main():
     global WINDOW_OVERRIDE
     WINDOW_OVERRIDE = args.window
 
-    wanted = args.index or ["hnsw", "prism"]
-    if len(wanted) > 2:
-        sys.exit("error: at most two series (the palette defines two validated slots)")
+    # Fixed order, so a hue always means the same index no matter which subset
+    # is plotted.
+    wanted = args.index or ["hnsw", "prism", "ivfflat"]
+    if len(wanted) > 3:
+        sys.exit("error: at most three series (slots 1-3 are what validate all-pairs)")
 
     series = []
     for name in wanted:

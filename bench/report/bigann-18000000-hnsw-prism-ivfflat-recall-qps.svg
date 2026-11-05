@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 560" width="900" height="560" role="img" aria-labelledby="t d" font-family="Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+<title id="t">Recall vs throughput — pgvector HNSW vs PRISM vs pgvector IVFFlat on bigann_18000000</title>
+<desc id="d">Single-client recall/throughput tradeoff. pgvector HNSW ef 10: recall 0.6227, 2,617 QPS, ef 20: recall 0.7532, 1,762 QPS, ef 40: recall 0.8551, 1,116 QPS, ef 80: recall 0.9263, 650 QPS, ef 160: recall 0.9686, 364 QPS, ef 320: recall 0.9891, 204 QPS; PRISM np 5: recall 0.6439, 6,433 QPS, np 10: recall 0.7838, 4,505 QPS, np 20: recall 0.8826, 3,058 QPS, np 40: recall 0.9437, 2,074 QPS, np 80: recall 0.9781, 1,382 QPS, np 160: recall 0.9923, 837 QPS, np 320: recall 0.9970, 473 QPS; pgvector IVFFlat pr 1: recall 0.3630, 720 QPS, pr 2: recall 0.5212, 372 QPS, pr 5: recall 0.7067, 149 QPS, pr 10: recall 0.8254, 73 QPS, pr 20: recall 0.9097, 37 QPS, pr 50: recall 0.9710, 16 QPS, pr 100: recall 0.9905, 8 QPS.</desc>
+<style>
+:root{--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--series1:#2a78d6;--series2:#eb6834;--series3:#1baf7a;}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--series1:#3987e5;--series2:#d95926;--series3:#199e70;}}
+:root[data-theme="dark"]{--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--series1:#3987e5;--series2:#d95926;--series3:#199e70;}
+.bg{fill:var(--surface)}
+.ttl{fill:var(--ink);font-size:19px;font-weight:600}
+.sub{fill:var(--ink2);font-size:12.5px}
+.foot{fill:var(--muted);font-size:11.5px}
+.axlbl{fill:var(--ink2);font-size:12.5px;font-weight:500}
+.tick{fill:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums}
+.grid{stroke:var(--grid);stroke-width:1}
+.axis{stroke:var(--axis);stroke-width:1}
+.lgnd{fill:var(--ink);font-size:12.5px;font-weight:500}
+.line1{fill:none;stroke:var(--series1);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.dot1{fill:var(--series1);stroke:var(--surface);stroke-width:2}
+.sw1{fill:var(--series1)}
+.line2{fill:none;stroke:var(--series2);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.dot2{fill:var(--series2);stroke:var(--surface);stroke-width:2}
+.sw2{fill:var(--series2)}
+.line3{fill:none;stroke:var(--series3);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.dot3{fill:var(--series3);stroke:var(--surface);stroke-width:2}
+.sw3{fill:var(--series3)}
+.plbl{fill:var(--ink);font-size:11.5px;font-weight:600;font-variant-numeric:tabular-nums}
+</style>
+<rect class="bg" x="0" y="0" width="900" height="560"/>
+<text class="ttl" x="78" y="34">Recall vs throughput — 18M BIGANN (SIFT) vectors, 3 index types</text>
+<text class="sub" x="78" y="55">18,000,000 × 128-d vectors, same table · index fully resident in shared_buffers · 1 client · 60s per point</text>
+<rect class="sw1" x="78" y="74" width="22" height="4" rx="2"/>
+<circle class="dot1" cx="89" cy="76" r="5"/>
+<text class="lgnd" x="110" y="80">pgvector HNSW  (ef_search)</text>
+<rect class="sw2" x="328.6" y="74" width="22" height="4" rx="2"/>
+<circle class="dot2" cx="339.6" cy="76" r="5"/>
+<text class="lgnd" x="360.6" y="80">PRISM  (nprobe)</text>
+<rect class="sw3" x="501.1" y="74" width="22" height="4" rx="2"/>
+<circle class="dot3" cx="512.1" cy="76" r="5"/>
+<text class="lgnd" x="533.1" y="80">pgvector IVFFlat  (probes)</text>
+<line class="grid" x1="78" y1="457.4" x2="848" y2="457.4"/>
+<text class="tick" x="68" y="461.4" text-anchor="end">10</text>
+<line class="grid" x1="78" y1="422.0" x2="848" y2="422.0"/>
+<text class="tick" x="68" y="426.0" text-anchor="end">20</text>
+<line class="grid" x1="78" y1="401.3" x2="848" y2="401.3"/>
+<text class="tick" x="68" y="405.3" text-anchor="end">30</text>
+<line class="grid" x1="78" y1="375.3" x2="848" y2="375.3"/>
+<text class="tick" x="68" y="379.3" text-anchor="end">50</text>
+<line class="grid" x1="78" y1="339.9" x2="848" y2="339.9"/>
+<text class="tick" x="68" y="343.9" text-anchor="end">100</text>
+<line class="grid" x1="78" y1="304.5" x2="848" y2="304.5"/>
+<text class="tick" x="68" y="308.5" text-anchor="end">200</text>
+<line class="grid" x1="78" y1="283.8" x2="848" y2="283.8"/>
+<text class="tick" x="68" y="287.8" text-anchor="end">300</text>
+<line class="grid" x1="78" y1="257.7" x2="848" y2="257.7"/>
+<text class="tick" x="68" y="261.7" text-anchor="end">500</text>
+<line class="grid" x1="78" y1="222.3" x2="848" y2="222.3"/>
+<text class="tick" x="68" y="226.3" text-anchor="end">1,000</text>
+<line class="grid" x1="78" y1="187.0" x2="848" y2="187.0"/>
+<text class="tick" x="68" y="191.0" text-anchor="end">2,000</text>
+<line class="grid" x1="78" y1="166.3" x2="848" y2="166.3"/>
+<text class="tick" x="68" y="170.3" text-anchor="end">3,000</text>
+<line class="grid" x1="78" y1="140.2" x2="848" y2="140.2"/>
+<text class="tick" x="68" y="144.2" text-anchor="end">5,000</text>
+<line class="axis" x1="78.0" y1="482" x2="78.0" y2="487"/>
+<line class="axis" x1="137.2" y1="482" x2="137.2" y2="487"/>
+<text class="tick" x="137.2" y="502" text-anchor="middle">0.4</text>
+<line class="axis" x1="196.5" y1="482" x2="196.5" y2="487"/>
+<line class="axis" x1="255.7" y1="482" x2="255.7" y2="487"/>
+<text class="tick" x="255.7" y="502" text-anchor="middle">0.5</text>
+<line class="axis" x1="314.9" y1="482" x2="314.9" y2="487"/>
+<line class="axis" x1="374.2" y1="482" x2="374.2" y2="487"/>
+<text class="tick" x="374.2" y="502" text-anchor="middle">0.6</text>
+<line class="axis" x1="433.4" y1="482" x2="433.4" y2="487"/>
+<line class="axis" x1="492.6" y1="482" x2="492.6" y2="487"/>
+<text class="tick" x="492.6" y="502" text-anchor="middle">0.7</text>
+<line class="axis" x1="551.8" y1="482" x2="551.8" y2="487"/>
+<line class="axis" x1="611.1" y1="482" x2="611.1" y2="487"/>
+<text class="tick" x="611.1" y="502" text-anchor="middle">0.8</text>
+<line class="axis" x1="670.3" y1="482" x2="670.3" y2="487"/>
+<line class="axis" x1="729.5" y1="482" x2="729.5" y2="487"/>
+<text class="tick" x="729.5" y="502" text-anchor="middle">0.9</text>
+<line class="axis" x1="788.8" y1="482" x2="788.8" y2="487"/>
+<line class="axis" x1="848.0" y1="482" x2="848.0" y2="487"/>
+<text class="tick" x="848.0" y="502" text-anchor="middle">1.0</text>
+<line class="axis" x1="78" y1="482" x2="848" y2="482"/>
+<line class="axis" x1="78" y1="482" x2="78" y2="112"/>
+<text class="axlbl" x="463" y="528" text-anchor="middle">recall@10  (fraction of true nearest neighbours returned)</text>
+<text class="axlbl" transform="translate(22,297) rotate(-90)" text-anchor="middle">queries per second  (log scale)</text>
+<polyline class="line1" points="401.0,173.2 555.6,193.4 676.3,216.7 760.7,244.3 810.8,273.9 835.1,303.5"/>
+<polyline class="line2" points="426.2,127.3 591.9,145.5 708.9,165.3 781.3,185.1 822.1,205.8 838.9,231.4 844.4,260.5"/>
+<polyline class="line3" points="93.4,239.1 280.8,272.8 500.6,319.5 641.2,355.8 741.0,391.0 813.6,434.5 836.7,466.7"/>
+<circle class="dot1" cx="401.0" cy="173.2" r="5"/>
+<text class="plbl" x="412.0" y="163.2">ef 10</text>
+<circle class="dot1" cx="555.6" cy="193.4" r="5"/>
+<text class="plbl" x="566.6" y="183.4">ef 20</text>
+<circle class="dot1" cx="676.3" cy="216.7" r="5"/>
+<text class="plbl" x="687.3" y="206.7">ef 40</text>
+<circle class="dot1" cx="760.7" cy="244.3" r="5"/>
+<text class="plbl" x="771.7" y="234.3">ef 80</text>
+<circle class="dot1" cx="810.8" cy="273.9" r="5"/>
+<text class="plbl" x="799.8" y="290.9" text-anchor="end">ef 160</text>
+<circle class="dot1" cx="835.1" cy="303.5" r="5"/>
+<text class="plbl" x="824.1" y="320.5" text-anchor="end">ef 320</text>
+<circle class="dot2" cx="426.2" cy="127.3" r="5"/>
+<text class="plbl" x="415.2" y="144.3" text-anchor="end">np 5</text>
+<circle class="dot2" cx="591.9" cy="145.5" r="5"/>
+<text class="plbl" x="580.9" y="162.5" text-anchor="end">np 10</text>
+<circle class="dot2" cx="708.9" cy="165.3" r="5"/>
+<text class="plbl" x="697.9" y="182.3" text-anchor="end">np 20</text>
+<circle class="dot2" cx="781.3" cy="185.1" r="5"/>
+<text class="plbl" x="770.3" y="202.1" text-anchor="end">np 40</text>
+<circle class="dot2" cx="822.1" cy="205.8" r="5"/>
+<text class="plbl" x="811.1" y="222.8" text-anchor="end">np 80</text>
+<circle class="dot2" cx="838.9" cy="231.4" r="5"/>
+<text class="plbl" x="827.9" y="248.4" text-anchor="end">np 160</text>
+<circle class="dot2" cx="844.4" cy="260.5" r="5"/>
+<text class="plbl" x="833.4" y="277.5" text-anchor="end">np 320</text>
+<circle class="dot3" cx="93.4" cy="239.1" r="5"/>
+<text class="plbl" x="104.4" y="229.1">pr 1</text>
+<circle class="dot3" cx="280.8" cy="272.8" r="5"/>
+<text class="plbl" x="291.8" y="262.8">pr 2</text>
+<circle class="dot3" cx="500.6" cy="319.5" r="5"/>
+<text class="plbl" x="511.6" y="309.5">pr 5</text>
+<circle class="dot3" cx="641.2" cy="355.8" r="5"/>
+<text class="plbl" x="652.2" y="345.8">pr 10</text>
+<circle class="dot3" cx="741.0" cy="391.0" r="5"/>
+<text class="plbl" x="752.0" y="381.0">pr 20</text>
+<circle class="dot3" cx="813.6" cy="434.5" r="5"/>
+<text class="plbl" x="802.6" y="451.5" text-anchor="end">pr 50</text>
+<circle class="dot3" cx="836.7" cy="466.7" r="5"/>
+<text class="plbl" x="825.7" y="483.7" text-anchor="end">pr 100</text>
+<text class="foot" x="78" y="550">Postgres 18.6 · k=10 · 1,000 distinct queries · pgvector HNSW 13.95 GiB · PRISM 1.31 GiB · pgvector IVFFlat 9.17 GiB</text>
+</svg>

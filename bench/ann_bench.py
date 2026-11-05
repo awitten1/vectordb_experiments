@@ -66,6 +66,7 @@ def order_by(ds, index: str) -> str:
 def main() -> None:
     args = parse_args()
     ds = datasets.load(args.dataset, seed=args.seed, num_queries=args.num_queries)
+    ds.table_override = args.table
     if args.k > ds.neighbors.shape[1]:
         sys.exit(f"error: k={args.k} exceeds the {ds.neighbors.shape[1]} stored neighbors per query")
     test = ds.test[: args.num_queries]
@@ -163,6 +164,11 @@ def parse_args() -> argparse.Namespace:
     r.add_argument("--num-queries", type=int, default=1000,
                    help="queries to run; also the synthetic query set size (default: 1000)")
     r.add_argument("--seed", type=int, default=42, help="seed for synthetic data (default: 42)")
+    r.add_argument("--table", help="use this table instead of the dataset's default. A second "
+                   "copy of the same data can then carry a different index type, which is the "
+                   "only way to measure two pgvector indexes independently: HNSW and IVFFlat "
+                   "share an operator on the same operand types, so no query shape reaches one "
+                   "and not the other, and on a single table the planner picks on cost")
     r.add_argument("--reload", action="store_true", help="drop and reload the table")
     r.add_argument("--dsn", default=DEFAULT_DSN, help=f"libpq connection string (default: {DEFAULT_DSN!r})")
     r.add_argument("--no-save", action="store_true", help="don't append results to bench/results/")
@@ -370,6 +376,12 @@ def query_worker(dsn, query, guc, value, k, vectors, duration=0.0, barrier=None)
         # monotonic_ns is system-wide on Linux, so starts/ends compare across workers
         start = time.monotonic_ns()
         deadline = start + int(duration * 1e9) if duration else 0
+        # The deadline is checked between passes, never inside one, so at least
+        # one full pass always runs and `duration` is a floor rather than a cap.
+        # Breaking mid-pass leaves rows of ids[] unanswered while recall is
+        # computed over the whole query set, which scales the reported recall by
+        # however much of the set got through: ivfflat at probes=100 managed 492
+        # of 1000 queries in 60s and reported 0.485 instead of ~0.987.
         while True:
             for i, vec in enumerate(vectors):
                 t0 = time.perf_counter_ns()
@@ -379,20 +391,20 @@ def query_worker(dsn, query, guc, value, k, vectors, duration=0.0, barrier=None)
                 # ids is overwritten on every pass; the queries are identical,
                 # so the last pass is as good as the first for recall
                 ids[i, : len(rows)] = [r[0] for r in rows]
-                if deadline and time.monotonic_ns() >= deadline:
-                    break
-            else:
-                if not deadline:
-                    break
-                continue
-            break
+            if not deadline or time.monotonic_ns() >= deadline:
+                break
         end = time.monotonic_ns()
     return ids, np.asarray(latencies, dtype=np.int64), start, end
 
 
 def summarize(ids, neighbors, k, latencies_ns, wall_ns, executed=None) -> dict:
     truth = neighbors[:, :k]
-    hits = sum(len(np.intersect1d(ids[i], truth[i])) for i in range(len(ids)))
+    answered = [i for i in range(len(ids)) if (ids[i] != -1).any()]
+    if len(answered) != len(ids):
+        sys.exit(f"error: only {len(answered)} of {len(ids)} queries returned rows; "
+                 f"recall would be understated. This should be unreachable now that "
+                 f"the duration deadline is checked between passes.")
+    hits = sum(len(np.intersect1d(ids[i], truth[i])) for i in answered)
     ms = latencies_ns / 1e6
     # recall is over the distinct query set; QPS is over everything executed,
     # which differs from it once --duration makes workers cycle their slice

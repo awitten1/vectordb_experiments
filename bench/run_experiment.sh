@@ -5,10 +5,10 @@
 # Usage: bench/run_experiment.sh [phase ...]          (no phase = all of them)
 #   phases: data build query concurrency profile build_prism compare ivfflat exact
 #
-# NOTE ON ORDER: ann_bench.py keeps at most one vector index per table, so the
-# ivfflat phase DROPS the HNSW index. Everything that needs HNSW (query,
-# concurrency, profile) therefore runs before ivfflat, and re-running `build`
-# afterwards is what restores it.
+# NOTE ON ORDER: ann_bench.py keeps at most one vector index per table unless
+# --keep-other-indexes is passed. The ivfflat phase builds on its own copy of
+# the table, so it leaves the HNSW index alone; the compare phase does drop the
+# prism index, and says so.
 #   e.g. bench/run_experiment.sh query concurrency
 #
 # Each phase is resumable and safe to re-run: the dataset, the table and the
@@ -203,8 +203,8 @@ index_args() {
 # left out: a query phase that misses shared_buffers measures the disk, not the
 # index (ef_search=10 went from 8 QPS to 945 QPS here on that alone).
 prewarm_or_die() {
-  say "prewarming table + index into shared_buffers"
-  local t; t="$(dataset_table)"
+  local t="${1:-$(dataset_table)}"
+  say "prewarming $t + its indexes into shared_buffers"
 
   # Prewarming an already-resident pool re-reads every block for nothing, so
   # check first. The residency assert below still runs either way.
@@ -251,7 +251,7 @@ SQL
 }
 
 report_sizes() {
-  "${PSQL[@]}" -v t="$(dataset_table)" >&2 <<'SQL'
+  "${PSQL[@]}" -v t="${1:-$(dataset_table)}" >&2 <<'SQL'
 SELECT c.relname, pg_size_pretty(pg_relation_size(c.oid)) AS size,
        pg_relation_size(c.oid) / current_setting('block_size')::int AS blocks
 FROM pg_class c
@@ -358,36 +358,52 @@ phase_concurrency() {
   done
 }
 
+# IVFFlat on its own copy of the table.
+#
+# HNSW and IVFFlat are both pgvector indexes on `vector`, reached by the same
+# operator on the same operand types, so -- unlike prism -- there is no query
+# spelling that reaches one and not the other. On a single table the planner
+# decides on cost, and ivfflat.probes feeds that estimate, so the choice can
+# flip part-way up a sweep. A second table sidesteps it: one ANN index per
+# table, nothing to flip to, and the HNSW index is never touched.
+#
+# The copy is made server-side rather than reloaded through the client: a
+# CREATE TABLE AS of 10 GB is minutes of sequential I/O against ~9 minutes of
+# COPY from numpy. It stays a logged table so the IVFFlat build pays the same
+# WAL cost the HNSW build did and the two build times stay comparable.
+#
+# Only one index is resident at a time, by design. This arm prewarms its own
+# table and index (~20 GB) and evicts the HNSW pages; going back to HNSW
+# re-prewarms. shared_buffers stays at QUERY_SB.
 phase_ivfflat() {
-  # ann_bench.py's ensure_index drops any other vector index on the table, so
-  # this phase destroys the HNSW index. It costs ~27 min to rebuild at 18M, so
-  # say so plainly rather than letting it happen silently.
-  if "$BIN/pg_ctl" -D "$PGDATA_DIR" status >/dev/null 2>&1; then
-    local existing
-    existing="$("${PSQL[@]}" -At -c "SELECT string_agg(c.relname, ' ')
-        FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
-        WHERE i.indrelid = '$(dataset_table)'::regclass AND c.relname LIKE '%hnsw%'" 2>/dev/null || true)"
-    if [ -n "$existing" ]; then
-      echo "warning: the ivfflat phase will DROP the HNSW index ($existing)." >&2
-      echo "         Re-run the 'build' phase afterwards to restore it." >&2
-      if [ "${ALLOW_INDEX_SWAP:-0}" != 1 ]; then
-        die "refusing to drop it. Re-run with ALLOW_INDEX_SWAP=1 to proceed,
-  or run the ivfflat phase on its own once you are done with HNSW."
-      fi
-    fi
-  fi
-  dsm_preflight
+  local src ivf
+  src="$(dataset_table)"
+  ivf="${src}_ivf"
+
   start_server "$BUILD_SB" "$BUILD_MWM"
-  say "building IVFFlat"
-  bench --index ivfflat $(index_args) \
+  local n
+  n="$("${PSQL[@]}" -At -c "SELECT count(*) FROM $ivf" 2>/dev/null || echo 0)"
+  if [ "$n" != "$("${PSQL[@]}" -At -c "SELECT count(*) FROM $src")" ]; then
+    say "copying $src -> $ivf (server-side)"
+    "${PSQL[@]}" -c "DROP TABLE IF EXISTS $ivf" >/dev/null
+    "${PSQL[@]}" -c "CREATE TABLE $ivf AS SELECT * FROM $src" >/dev/null
+    "${PSQL[@]}" -c "ANALYZE $ivf" >/dev/null
+  else
+    echo "reusing $ivf ($n rows)" >&2
+  fi
+
+  say "building IVFFlat on $ivf"
+  bench --index ivfflat $(index_args) --table "$ivf" \
         --maintenance-work-mem "$BUILD_MWM" --parallel-workers "$WORKERS" \
         --sweep 10 --num-queries 100 ${REBUILD:+--rebuild} --no-save
-  report_sizes
+  report_sizes "$ivf"
+
   start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0
-  prewarm_or_die
-  say "IVFFlat probes sweep ($PROBE_SWEEP), ${DURATION}s per point"
-  bench --index ivfflat $(index_args) --sweep "$PROBE_SWEEP" \
+  prewarm_or_die "$ivf"
+  say "IVFFlat probes sweep ($PROBE_SWEEP), 1 client, ${DURATION}s per point"
+  bench --index ivfflat $(index_args) --table "$ivf" --sweep "$PROBE_SWEEP" \
         --num-queries "$NUM_QUERIES" --duration "$DURATION"
+  report_sizes "$ivf"
 }
 
 phase_exact() {
