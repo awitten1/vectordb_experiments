@@ -9,7 +9,10 @@ estimate.
 
 - AMD Ryzen 9 9900X, 12 cores / 24 threads, 64 MiB L3 (2 instances), 1 NUMA node
 - 59 GiB RAM, 3.6 TB disk, Linux 7.0
-- PostgreSQL 17.11 (`debugoptimized`, frame pointers), pgvector v0.8.7 (`-march=native`)
+- PostgreSQL 18.6 (`debugoptimized`), pgvector v0.8.7 (`-march=native`),
+  pg_vectorsearch 0.2.0-dev. Earlier numbers in this file were taken on 17.11;
+  where both exist they agree (HNSW `ef_search=320`: 0.9893 / 201 QPS on 17.11,
+  0.9891 / 204 QPS on 18.6).
 - `shared_buffers=28GB`; table and index fully resident, asserted via `pg_buffercache`
 - BIGANN (SIFT1B) first 18M vectors, 128-d uint8 → float4, k=10, 2,000 distinct queries
 - Client: Python + psycopg, prepared statements, same machine
@@ -146,10 +149,40 @@ That is the signature of placement being uncorrelated with graph adjacency.
 Elements are written in insertion order, which for BIGANN is file order, which is
 random with respect to vector space. Nothing to batch.
 
-### 2. `ReadRecentBuffer` cache — dead
+### 2. `ReadRecentBuffer` cache — we built the wrong thing
 
 Idea: remember the last buffer and skip the buffer table on a repeat.
-**Hit rate 0.79%.** Not worth the branch.
+**Hit rate 0.79%.** We called it dead. That was wrong, and the error was in the
+data structure, not the idea.
+
+`pg_vectorsearch` ships the same optimization as `prism.recent_buffers`, on by
+default, and its comment (`src/pg/bufstorage.c:43`) reports our bottleneck
+independently: *"~22% of warm query CPU is BufTableLookup hash probes inside
+ReadBuffer, for index pages that essentially never leave shared_buffers."*
+
+The difference is that they do not cache the *recent* buffers. They keep a
+**dense array indexed by block number** — one 4-byte `Buffer` per block of the
+relation, per backend, 11 MB for a 21 GB index — and re-pin through
+`ReadRecentBuffer`, which validates the tag and pins without touching the
+mapping table. There is no eviction policy to get wrong: a stale id fails
+validation and falls back to `ReadBuffer`, which refreshes the slot, so
+correctness never depends on the cache.
+
+On a fully resident index that turns nearly every `BufTableLookup` into an array
+index. Our 0.79% measured how often the *last* buffer was reused, which for a
+random graph walk is almost never; it says nothing about how often the block is
+already in the pool, which is always.
+
+They also measured something we did not: **38% of reads in a fresh backend, and
+14% even warmed, miss purely because a slot was never populated.** So they seed
+the array eagerly by sweeping all `NBuffers` buffer descriptors for tags
+matching the relation, reading tags without the header lock because
+`ReadRecentBuffer` re-validates anyway.
+
+`ReadRecentBuffer` is a public API (`bufmgr.h:206`), so unlike the prefetch in
+attempt 4 this needs **no core patch**. It attacks the whole 38%, not the single
+DRAM miss the prefetch hides. Untried on pgvector HNSW; it should be the next
+thing tried.
 
 ### 3. Graph-aware page layout — withdrawn before implementing
 
@@ -269,6 +302,87 @@ existing cluster. Recompile Postgres and pgvector, fresh `initdb`, reload,
 rebuild (~2–3 h wall clock), and WAL full-page writes get 4× bigger. Should be
 done in a **second `PGDATA`** so the 8 KiB cluster survives as a warm baseline.
 
+## PRISM (pg_vectorsearch) against HNSW, same table
+
+`pg_vectorsearch` 0.2.0-dev (`753e3e74`) builds a PRISM index — IVF-style, with
+a hierarchical centroid tree, RaBitQ-quantized posting lists, and two-stage
+search where 1-bit estimates with error bounds prune candidates before exact
+rerank from the heap. It is the opposite design point from a graph index.
+
+It indexes the **existing pgvector column with no rewrite and no copy**: `vec32`
+is binary-compatible with `vector`, and the extension installs a
+`WITHOUT FUNCTION` cast, which satisfies PostgreSQL's binary-coercibility rule
+for operator classes.
+
+### Build and size
+
+| | HNSW (m=16, efc=64) | PRISM (all auto) |
+|---|---:|---:|
+| build | 1,811 s | **170 s** |
+| size | 14 GB / 1,828,406 blk | **1,345 MB / 172,163 blk** |
+| peak build DSM | the whole graph | **26.7 MB** |
+
+Both ratios are 10.7x, coincidentally. Resolved settings: `nlist=26569`,
+`fan_out=163`, `nlevels=2`, `centroid_format=fastscan`, auto `nprobe=82`.
+
+Build phases: k-means 64.2 s (root 31.7 + subtrees 32.5), parallel table scan
+85.6 s, WAL logging 17.1 s, finalize 2.4 s.
+
+The DSM line is the one that matters operationally. HNSW's build puts the entire
+graph in dynamic shared memory, which is what made `dynamic_shared_memory_type`
+a 1,100x correctness-of-measurement trap (above). PRISM's build peaks at 26.7 MB
+and simply does not have that failure mode.
+
+One cost worth naming: `replicated 16,723,756 vectors (92.9% of 18,000,000,
+lambda=1)`. SOAR plus the 0.35 boundary band nearly doubles the posting entries.
+That is where the posting pages go, and it is what buys recall at a given
+`nprobe`.
+
+### Recall vs throughput
+
+![recall vs QPS](report/bigann-18000000-hnsw-prism-recall-qps.svg)
+
+Single client, 60 s per point, index fully resident, PostgreSQL 18.6.
+
+| prism.nprobe | recall@10 | QPS | | hnsw.ef_search | recall@10 | QPS |
+|---:|---:|---:|---|---:|---:|---:|
+| 5 | 0.6439 | 6,433 | | 10 | 0.6227 | 2,617 |
+| 10 | 0.7838 | 4,505 | | 20 | 0.7532 | 1,762 |
+| 20 | 0.8826 | 3,058 | | 40 | 0.8551 | 1,116 |
+| 40 | 0.9437 | 2,074 | | 80 | 0.9263 | 650 |
+| 80 | 0.9781 | 1,382 | | 160 | 0.9686 | 365 |
+| 160 | 0.9923 | 837 | | 320 | 0.9891 | 204 |
+| 320 | 0.9970 | 473 | | | | |
+
+**PRISM is roughly 3-5x faster at matched recall, and the gap widens as recall
+rises** (interpolating prism onto HNSW's recall points: ~3.1x at 0.855, ~3.6x at
+0.926, ~4.3x at 0.969, ~4.7x at 0.989). It also reaches 0.997, which the HNSW
+sweep never does — `ef_search` would have to go well past 320.
+
+A single scan at `nprobe=82`: 12.3 ms, 82 posting lists, 106,000 posting entries
+scanned, **96 rerank candidates for 10 rows**. The RaBitQ bounds pruned 106,000
+to 96.
+
+### Forcing one index or the other
+
+The two arms are not symmetric, and the asymmetry decides the protocol.
+
+`pg_vectorsearch_setup_pgvector_compat()` adds pgvector's `<->`, `<#>` and `<=>`
+to prism's operator families *as well as* prism's own, so `embedding <-> $1` is
+a candidate for **either** index and the planner decides on cost. The reverse
+does not hold: pgvector's `vector_l2_ops` has no `vec32` member, so
+`embedding::vec32 <-> $1::vec32` can only reach prism. The cast is
+`WITHOUT FUNCTION`, hence a zero-cost relabel, not a conversion.
+
+- **prism** is forced by operand type and is immune to a cost flip.
+- **HNSW** cannot be forced that way, and raising `ef_search` raises its
+  estimated cost until prism wins. It has to be the only ANN index on the table.
+
+So `phase_compare` runs prism first with both indexes present, then HNSW with
+prism dropped, and says so. Note the planner **prefers HNSW at default
+settings** on this table despite prism being several times faster — a cost-model
+gap worth looking at.
+
 ## Measurement protocol
 
 This cost more time than any of the optimizations, so it is worth writing down.
@@ -293,6 +407,18 @@ conclude a patch does nothing — which happened here, and produced a confident
 for this one patch was +13.7% (cross-protocol, invalid), then "no effect"
 (both arms patched, invalid), then +14.0% (verified). Also needs `make clean`
 per arm, and build output left visible.
+
+**Verify the query plan at every sweep point, not once per sweep.** The search
+parameter feeds the index's own cost estimate, so it can change which index the
+planner picks part-way up a sweep. With both an HNSW and a prism index on the
+table, `hnsw.ef_search=320` raised HNSW's estimated startup cost to 1799 and the
+planner switched to prism — producing an "HNSW" row at 1,369 QPS and recall
+0.9789, i.e. **3.7x faster than `ef_search=160`**, which is what gave it away.
+It was an exact match for prism at its auto `nprobe` of 82 (1,386 QPS, 0.9781,
+p50 0.704 ms). `check_plan` now runs per point with that point's GUC applied and
+aborts with the offending plan. Cost: 13 extra `EXPLAIN`s made the run 14s
+*faster* than the one before it, i.e. nothing, and all of it outside the
+measured window.
 
 **A single pass over the query set is not a throughput measurement.** Use a
 deadline (`--duration 60`) and record `queries_executed`. The first profile's
@@ -321,10 +447,35 @@ running server when its options match, skips prewarm when the relation is alread
 resident, and asserts residency before measuring. Patches and their A/B protocol
 are in `bench/patches/`.
 
+## Moving 17.11 -> 18.6
+
+`pg_vectorsearch` requires PostgreSQL 18+, so the cluster was rebuilt. Notes for
+anyone repeating it:
+
+- `pg_upgrade --copy` would have preserved the heap *and* the index files
+  (no `REINDEX`), but the data was deleted and reloaded instead. Reload 542 s,
+  HNSW rebuild 1,811 s; the index came out 61 blocks smaller, which is just
+  parallel-build nondeterminism.
+- **PostgreSQL 18 turns data checksums on by default.** `run_postgres.sh` now
+  passes `initdb --no-data-checksums` so the numbers here stay comparable. For a
+  `pg_upgrade` this is a hard stop, not a preference: the old and new clusters
+  must agree.
+- `pkglibdir` moved to `lib/x86_64-linux-gnu`. The `nm -D
+  postgres/install/lib/*/vector.so` assertion still globs correctly.
+- `build_postgres.sh` guarded the source download with `[ ! -d "$SRC" ]`, which
+  made `PG_VERSION` a silent no-op once a tree existed. It now writes a
+  `.pg_version` stamp and refuses a mismatch rather than rebuilding the wrong
+  version or deleting a tree that may carry patches.
+- The hash-prefetch patch applies cleanly to 18.6 (offsets only, one fuzz-2
+  hunk). It is **not** applied: both Postgres and pgvector are stock here.
+
 ## Open
 
 - `bench/REPORT.md` still describes the SIFT-1M run and needs rewriting around these numbers.
 - IVFFlat and exact-scan baselines on BIGANN 18M: deferred, not run.
 - 32 KiB block-size experiment: analysed above, not run.
+- Port PRISM's dense block->buffer map to pgvector HNSW (attempt 2, above): no
+  core patch needed, and it targets the whole 38%.
+- Why the planner prefers HNSW at default settings when PRISM is 3-5x faster.
 - Three-pass prefetch to hide the second dynahash miss: not tried.
 - shmem THP / huge pages for `shared_buffers`: not tried, and dTLB miss rate says it could matter.

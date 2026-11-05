@@ -3,7 +3,7 @@
 # bench/results/ (one JSON line per sweep point) plus bench/profiles/.
 #
 # Usage: bench/run_experiment.sh [phase ...]          (no phase = all of them)
-#   phases: data build query concurrency profile ivfflat exact
+#   phases: data build query concurrency profile build_prism compare ivfflat exact
 #
 # NOTE ON ORDER: ann_bench.py keeps at most one vector index per table, so the
 # ivfflat phase DROPS the HNSW index. Everything that needs HNSW (query,
@@ -23,7 +23,7 @@
 #   BUILD_MWM    maintenance_work_mem for CREATE INDEX (default 28GB)
 #   QUERY_SB     shared_buffers for the query phases (default 28GB)
 #   WORKERS      parallel workers for the build (default: nproc-1)
-#   EF_SWEEP, PROBE_SWEEP, CLIENTS     sweep points
+#   EF_SWEEP, PROBE_SWEEP, NPROBE_SWEEP, CLIENTS   sweep points
 #   NUM_QUERIES                        size of the query set (<=10000 for bigann)
 #   DURATION                           seconds per sweep point (default 60; 0 = one pass)
 #   EXACT_QUERIES                      queries for the exact baseline
@@ -53,6 +53,7 @@ BUILD_SB="${BUILD_SB:-2GB}"              # small: the build lives in the DSM are
 WORKERS="${WORKERS:-$(( $(nproc) - 1 ))}"
 EF_SWEEP="${EF_SWEEP:-10,20,40,80,160,320}"
 PROBE_SWEEP="${PROBE_SWEEP:-1,2,5,10,20,50,100}"
+NPROBE_SWEEP="${NPROBE_SWEEP:-5,10,20,40,80,160,320}"   # prism.nprobe
 CLIENTS="${CLIENTS:-4,8}"
 NUM_QUERIES="${NUM_QUERIES:-1000}"
 EXACT_QUERIES="${EXACT_QUERIES:-30}"     # each one scans the whole table
@@ -301,6 +302,51 @@ phase_query() {
   report_sizes
 }
 
+# Build a PRISM index next to the HNSW one, with build resources. Separate from
+# `compare` because a build needs maintenance_work_mem (it bounds the k-means
+# sample, and therefore the nlist the index resolves to) while the sweeps need
+# shared_buffers, and start_server restarts when those differ.
+phase_build_prism() {
+  start_server "$BUILD_SB" "$BUILD_MWM"
+  say "building PRISM (auto nlist, $WORKERS workers)"
+  "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS pg_vectorsearch" >/dev/null
+  bench --index prism --sweep 20 --num-queries 100 --no-save --keep-other-indexes \
+        --maintenance-work-mem "$BUILD_MWM" --parallel-workers "$WORKERS" \
+        ${REBUILD:+--rebuild}
+  report_sizes
+}
+
+# HNSW and PRISM measured on the same table, same buffer pool, same window.
+#
+# ORDER MATTERS, and the two arms are not symmetric. pg_vectorsearch adds
+# pgvector's operators to prism's operator families, so `embedding <-> $1` is a
+# candidate for *either* index and the planner decides on cost. pgvector's
+# vector_l2_ops family has no vec32 member, so the reverse is not true:
+# `embedding::vec32 <-> $1::vec32` can only reach prism.
+#
+# So prism is forced by type and is immune to a cost flip -- it runs first, with
+# both indexes in place. HNSW cannot be forced that way, and raising
+# hnsw.ef_search raises its estimated cost until prism wins (measured: at
+# ef_search=320 the planner switched to prism and reported an HNSW point 3.7x
+# faster than ef_search=160). HNSW therefore runs second and must be the only
+# ANN index, which is what ensure_index does by default.
+#
+# This phase consequently DROPS the prism index at the end. Re-run
+# `build_prism` to get it back; it takes under three minutes.
+phase_compare() {
+  start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0
+  prewarm_or_die
+  say "PRISM nprobe sweep ($NPROBE_SWEEP), 1 client, ${DURATION}s per point"
+  bench --index prism --sweep "$NPROBE_SWEEP" \
+        --num-queries "$NUM_QUERIES" --duration "$DURATION" --keep-other-indexes
+  say "HNSW ef_search sweep ($EF_SWEEP), 1 client, ${DURATION}s per point"
+  say "this drops the prism index so the planner cannot switch to it mid-sweep"
+  bench --index hnsw $(index_args) --sweep "$EF_SWEEP" \
+        --num-queries "$NUM_QUERIES" --duration "$DURATION"
+  report_sizes
+  echo "note: the prism index was dropped; run 'build_prism' to recreate it" >&2
+}
+
 phase_concurrency() {
   start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0
   prewarm_or_die
@@ -382,6 +428,8 @@ mkdir -p "$LOG_DIR"
 
 PHASES=("$@")
 [ ${#PHASES[@]} -eq 0 ] && PHASES=(data build query concurrency profile ivfflat exact)
+# `build_prism` and `compare` are not in the default set: they need
+# pg_vectorsearch installed, and `compare` drops the prism index as it runs.
 
 printf 'dataset=%s port=%s m=%s ef_construction=%s workers=%s\n' \
   "$DATASET" "$PGPORT" "$M" "$EF_CONSTRUCTION" "$WORKERS" >&2
@@ -390,8 +438,8 @@ printf 'phases: %s\n' "${PHASES[*]}" >&2
 START=$SECONDS
 for p in "${PHASES[@]}"; do
   case "$p" in
-    data|build|query|concurrency|ivfflat|exact|profile) "phase_$p" ;;
-    *) die "unknown phase '$p' (want: data build query concurrency ivfflat exact profile)" ;;
+    data|build|query|concurrency|ivfflat|exact|profile|compare|build_prism) "phase_$p" ;;
+    *) die "unknown phase '$p' (want: data build query concurrency profile build_prism compare ivfflat exact)" ;;
   esac
 done
 

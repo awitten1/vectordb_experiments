@@ -19,7 +19,11 @@ case "${1:-start}" in
   start)
     # Create the database cluster on first run (trust auth: local experiments only)
     if [ ! -d "$DATA" ]; then
-      "$BIN/initdb" -D "$DATA" -U postgres -A trust
+      # Postgres 18 turns data checksums on by default. Keep them off: the
+      # benchmark numbers in bench/FINDINGS.md were measured without them, and
+      # a silent default flip is exactly the kind of thing that shows up as an
+      # unexplained regression later.
+      "$BIN/initdb" -D "$DATA" -U postgres -A trust --no-data-checksums
     fi
     if "$BIN/pg_ctl" -D "$DATA" status >/dev/null; then
       echo "Postgres is already running"

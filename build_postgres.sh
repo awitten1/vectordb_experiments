@@ -3,7 +3,7 @@
 # Everything is installed under ./postgres/install
 set -euo pipefail
 
-PG_VERSION="${PG_VERSION:-17.11}"
+PG_VERSION="${PG_VERSION:-18.6}"
 # FRAME_POINTERS=1 builds with frame pointers so `perf record --call-graph fp`
 # gets complete stacks (costs ~1-2% throughput). Re-run without it to switch back.
 FRAME_POINTERS="${FRAME_POINTERS:-0}"
@@ -25,6 +25,18 @@ for tool in meson ninja; do
   fi
 done
 
+# A stamp records which version $SRC holds. Without it, bumping PG_VERSION with
+# a source tree already present is a silent no-op: the download is skipped and
+# the old version gets rebuilt. Refuse rather than delete, because the tree may
+# carry local patches (see bench/patches/).
+STAMP="$SRC/.pg_version"
+if [ -d "$SRC" ] && [ "$(cat "$STAMP" 2>/dev/null)" != "$PG_VERSION" ]; then
+  echo "error: $SRC holds Postgres $(cat "$STAMP" 2>/dev/null || echo 'unknown'), not $PG_VERSION." >&2
+  echo "       Remove it to switch versions: rm -rf $SRC $PREFIX" >&2
+  echo "       Any local patches in that tree are lost, so save them first." >&2
+  exit 1
+fi
+
 # 1. Download and unpack the Postgres source release
 if [ ! -d "$SRC" ]; then
   TARBALL="postgresql-$PG_VERSION.tar.gz"
@@ -45,6 +57,7 @@ if [ ! -d "$SRC" ]; then
   tar -xzf "$TARBALL" -C source.tmp --strip-components=1
   mv source.tmp "$SRC"
   rm -f "$TARBALL" "$TARBALL.sha256"
+  echo "$PG_VERSION" > "$STAMP"
 fi
 
 # 2. Build and install Postgres. Meson also writes $BUILD/compile_commands.json,

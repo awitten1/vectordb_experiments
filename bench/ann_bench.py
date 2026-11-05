@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Benchmark approximate nearest neighbor queries in pgvector.
 
-Loads a dataset into Postgres, builds an HNSW or IVFFlat index, then sweeps the
-search parameter (hnsw.ef_search / ivfflat.probes) and reports recall@k, QPS
-and latency percentiles for each value. Results are printed as a table and
-appended to bench/results/<dataset>.jsonl.
+Loads a dataset into Postgres, builds an HNSW, IVFFlat or PRISM index, then
+sweeps the search parameter (hnsw.ef_search / ivfflat.probes / prism.nprobe) and
+reports recall@k, QPS and latency percentiles for each value. Results are
+printed as a table and appended to bench/results/<dataset>.jsonl.
 
 The loaded table and the index are reused across runs when they already match,
 so repeated sweeps only pay for the queries. See bench/README.md for usage.
@@ -32,8 +32,35 @@ REPO_ROOT = BENCH_DIR.parent
 RESULTS_DIR = BENCH_DIR / "results"
 
 DEFAULT_DSN = f"host=localhost port={os.environ.get('PGPORT', '5432')} user=postgres dbname=postgres"
-DEFAULT_SWEEP = {"hnsw": "10,20,40,80,160,320", "ivfflat": "1,2,4,8,16,32,64", "none": "0"}
-SEARCH_GUC = {"hnsw": "hnsw.ef_search", "ivfflat": "ivfflat.probes", "none": None}
+DEFAULT_SWEEP = {"hnsw": "10,20,40,80,160,320", "ivfflat": "1,2,4,8,16,32,64",
+                 "prism": "5,10,20,40,80,160,320", "none": "0"}
+SEARCH_GUC = {"hnsw": "hnsw.ef_search", "ivfflat": "ivfflat.probes",
+              "prism": "prism.nprobe", "none": None}
+INDEX_AMS = ("hnsw", "ivfflat", "prism")
+
+# PRISM declares its opclasses for its own vec32 type. The type is binary
+# compatible with pgvector's vector, and the extension installs a WITHOUT
+# FUNCTION cast between them, so an opclass FOR TYPE vec32 is valid on a
+# vector column -- no rewrite and no copy.
+PRISM_OPCLASS = {"euclidean": "vec32_l2_ops",
+                 "angular": "vec32_cosine_ops",
+                 "ip": "vec32_ip_ops"}
+
+
+def order_by(ds, index: str) -> str:
+    """The ORDER BY expression that reaches `index` and no other index.
+
+    Both extensions spell the distance operator the same way, and
+    pg_vectorsearch adds pgvector's operators to prism's operator families, so
+    `embedding <-> $1` is a candidate for either index and the planner picks on
+    cost -- which on this data means HNSW. Resolving the operator on vec32
+    operands instead leaves only prism, because pgvector's vector_l2_ops family
+    has no vec32 member. The casts are WITHOUT FUNCTION, so ::vec32 is a
+    zero-cost relabel rather than a conversion.
+    """
+    if index == "prism":
+        return f"embedding::vec32 {ds.operator} %s::vec32"
+    return f"embedding {ds.operator} %s"
 
 
 def main() -> None:
@@ -46,12 +73,15 @@ def main() -> None:
     log(f"dataset {ds.name}: {len(ds.train)} x {ds.dim}, {len(test)} queries, metric {ds.metric}")
 
     with connect(args.dsn) as conn:
+        if args.index == "prism":
+            conn.execute("CREATE EXTENSION IF NOT EXISTS pg_vectorsearch")
         load_table(conn, ds, args.reload)
         index_name, build = ensure_index(conn, ds, args)
         check_plan(conn, ds, args, index_name, test[0])
         server = conn.execute(
             "SELECT current_setting('server_version'), extversion FROM pg_extension WHERE extname = 'vector'"
         ).fetchone()
+        extra = prism_meta(conn, index_name) if args.index == "prism" else {}
 
     meta = {
         "dataset": ds.name,
@@ -68,6 +98,7 @@ def main() -> None:
         "postgres_version": server[0],
         "pgvector_version": server[1],
         "pgvector_git": pgvector_git_rev(),
+        **extra,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -78,8 +109,11 @@ def main() -> None:
     for value in sweep:
         if args.index == "hnsw" and value < args.k:
             log(f"warning: ef_search={value} < k={args.k}; HNSW returns at most ef_search rows")
+        with connect(args.dsn) as conn:
+            check_plan(conn, ds, args, index_name, test[0], guc, value)
         ids, latencies_ns, wall_ns, executed = run_queries(
-            args.dsn, ds, test, args.k, guc, value, args.clients, args.duration)
+            args.dsn, ds, test, args.k, guc, value, args.clients, args.duration,
+            index=args.index)
         result = {**meta, "search_param": guc, "search_value": value if guc else None,
                   **summarize(ids, neighbors, args.k, latencies_ns, wall_ns, executed)}
         rows.append(result)
@@ -98,11 +132,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset", required=True,
                    help="synthetic:<n>x<d>[:<metric>] or an ann-benchmarks name such as sift-128-euclidean")
-    p.add_argument("--index", choices=["hnsw", "ivfflat", "none"], default="hnsw",
+    p.add_argument("--index", choices=["hnsw", "ivfflat", "prism", "none"], default="hnsw",
                    help="index to benchmark; 'none' runs exact sequential scans (default: hnsw)")
     p.add_argument("--k", type=int, default=10, help="neighbors per query (default: 10)")
-    p.add_argument("--sweep", help="comma-separated ef_search (hnsw) or probes (ivfflat) values "
-                   f"(default: hnsw {DEFAULT_SWEEP['hnsw']}; ivfflat {DEFAULT_SWEEP['ivfflat']})")
+    p.add_argument("--sweep", help="comma-separated ef_search (hnsw), probes (ivfflat) or "
+                   f"nprobe (prism) values (default: hnsw {DEFAULT_SWEEP['hnsw']}; "
+                   f"ivfflat {DEFAULT_SWEEP['ivfflat']}; prism {DEFAULT_SWEEP['prism']})")
 
     b = p.add_argument_group("index build")
     b.add_argument("--m", type=int, default=16, help="HNSW m (default: 16)")
@@ -113,6 +148,11 @@ def parse_args() -> argparse.Namespace:
     b.add_argument("--parallel-workers", type=int, default=7,
                    help="max_parallel_maintenance_workers for CREATE INDEX (default: 7)")
     b.add_argument("--rebuild", action="store_true", help="rebuild the index even if it already exists")
+    b.add_argument("--keep-other-indexes", action="store_true",
+                   help="do not drop the table's other ANN indexes. Off by default because the "
+                        "planner has to be left no choice but the index being measured; pass this "
+                        "when two indexes must coexist and the query itself forces the choice "
+                        "(see order_by). check_plan still verifies which index the plan uses")
 
     r = p.add_argument_group("run")
     r.add_argument("--clients", type=int, default=1, help="concurrent connections issuing queries (default: 1)")
@@ -194,33 +234,41 @@ def build_params(args: argparse.Namespace, rows: int) -> dict:
     if args.index == "ivfflat":
         lists = args.lists or max(1, rows // 1000 if rows <= 1_000_000 else int(np.sqrt(rows)))
         return {"lists": lists}
+    # prism derives nlist, fan_out and the rest from the row count at build
+    # time; prism_index_settings() reports what it resolved (see prism_meta).
     return {}
 
 
 def ensure_index(conn: psycopg.Connection, ds: datasets.Dataset, args: argparse.Namespace):
-    """Make the requested index the only ANN index on the table.
+    """Make sure the requested index exists, and return (name, build info).
 
-    Other HNSW/IVFFlat indexes are dropped so the planner can't pick one of them
-    instead. Returns (index name, build info for the results).
+    By default the table's other ANN indexes are dropped, so the planner cannot
+    pick one of them instead of the one being measured. --keep-other-indexes
+    skips that, for a run where two indexes coexist and order_by() is what
+    forces the choice; check_plan then verifies the plan really used it.
     """
     table = ident(ds.table)
     params = build_params(args, len(ds.train))
     wanted = None
     if args.index != "none":
         suffix = "_".join(f"{k}{v}" for k, v in params.items())
-        wanted = ident(f"{ds.table}_{args.index}_{suffix}")
+        wanted = ident(f"{ds.table}_{args.index}_{suffix}" if suffix
+                       else f"{ds.table}_{args.index}")
 
     existing = [r[0] for r in conn.execute(
         """SELECT i.relname FROM pg_index x
            JOIN pg_class i ON i.oid = x.indexrelid
            JOIN pg_am am ON am.oid = i.relam
-           WHERE x.indrelid = %s::regclass AND am.amname IN ('hnsw', 'ivfflat')""",
-        (table,),
+           WHERE x.indrelid = %s::regclass AND am.amname = ANY(%s)""",
+        (table, list(INDEX_AMS)),
     )]
     for name in existing:
-        if name != wanted or args.rebuild:
-            log(f"dropping index {name}")
-            conn.execute(f"DROP INDEX {name}")
+        if name == wanted and not args.rebuild:
+            continue
+        if args.keep_other_indexes and name != wanted:
+            continue
+        log(f"dropping index {name}")
+        conn.execute(f"DROP INDEX {name}")
 
     build = {"build_s": None, "index_bytes": None, "parallel_workers": None}
     if wanted is None:
@@ -231,9 +279,11 @@ def ensure_index(conn: psycopg.Connection, ds: datasets.Dataset, args: argparse.
         log(f"building {wanted} ...")
         conn.execute(f"SET maintenance_work_mem = '{args.maintenance_work_mem}'")
         conn.execute(f"SET max_parallel_maintenance_workers = {args.parallel_workers}")
+        opclass = PRISM_OPCLASS[ds.metric] if args.index == "prism" else ds.opclass
         start = time.perf_counter()
+        with_clause = f" WITH ({with_opts})" if with_opts else ""
         conn.execute(f"CREATE INDEX {wanted} ON {table} USING {args.index} "
-                     f"(embedding {ds.opclass}) WITH ({with_opts})")
+                     f"(embedding {opclass}){with_clause}")
         build["build_s"] = round(time.perf_counter() - start, 3)
         build["parallel_workers"] = args.parallel_workers
         log(f"built in {build['build_s']:.1f}s")
@@ -244,14 +294,28 @@ def ensure_index(conn: psycopg.Connection, ds: datasets.Dataset, args: argparse.
     return wanted, build
 
 
-def check_plan(conn, ds, args, index_name, query_vec) -> None:
-    """Fail if the planner won't use the index we mean to benchmark."""
+def check_plan(conn, ds, args, index_name, query_vec, guc=None, value=None) -> None:
+    """Fail if the planner won't use the index we mean to benchmark.
+
+    This has to be re-checked for every sweep point, with that point's GUC
+    applied, because the search parameter feeds the index's own cost estimate.
+    Raising hnsw.ef_search raises HNSW's estimated startup cost, so with another
+    ANN index on the table the planner can switch to it part-way up a sweep --
+    measured here at ef_search=320, where it quietly moved to the prism index
+    and produced an HNSW row that was 3.7x faster than ef_search=160.
+    """
+    if guc:
+        conn.execute(f"SET {guc} = {value}")
     plan = "\n".join(r[0] for r in conn.execute(
-        f"EXPLAIN SELECT id FROM {ident(ds.table)} ORDER BY embedding {ds.operator} %s LIMIT {args.k}",
+        f"EXPLAIN SELECT id FROM {ident(ds.table)} "
+        f"ORDER BY {order_by(ds, args.index)} LIMIT {args.k}",
         (query_vec,),
     ))
+    at = f" at {guc}={value}" if guc else ""
     if index_name and index_name not in plan:
-        sys.exit(f"error: the query plan doesn't use {index_name}:\n{plan}")
+        sys.exit(f"error: the query plan doesn't use {index_name}{at}:\n{plan}\n"
+                 f"hint: another index on the table won on cost. Drop it (omit "
+                 f"--keep-other-indexes) or force this one through the query shape.")
     if not index_name and "Index" in plan:
         sys.exit(f"error: expected an exact sequential scan:\n{plan}")
 
@@ -259,7 +323,7 @@ def check_plan(conn, ds, args, index_name, query_vec) -> None:
 # --- queries -----------------------------------------------------------------
 
 
-def run_queries(dsn, ds, test, k, guc, value, clients, duration=0.0):
+def run_queries(dsn, ds, test, k, guc, value, clients, duration=0.0, index="hnsw"):
     """Run the test queries, split across `clients` connections.
 
     With duration=0 each query runs exactly once. With duration > 0 every
@@ -273,7 +337,7 @@ def run_queries(dsn, ds, test, k, guc, value, clients, duration=0.0):
     wall time in ns from the first query start to the last query end, and the
     total number of queries executed).
     """
-    query = f"SELECT id FROM {ident(ds.table)} ORDER BY embedding {ds.operator} %s LIMIT {k}"
+    query = f"SELECT id FROM {ident(ds.table)} ORDER BY {order_by(ds, index)} LIMIT {k}"
     slices = np.array_split(np.arange(len(test)), clients)
     jobs = [(dsn, query, guc, value, k, test[s], duration) for s in slices]
 
@@ -365,6 +429,22 @@ def ident(name: str) -> str:
     if len(name) <= 63:
         return name
     return name[:54] + "_" + hashlib.sha1(name.encode()).hexdigest()[:8]
+
+
+def prism_meta(conn: psycopg.Connection, index_name: str) -> dict:
+    """Extension build and the settings PRISM resolved for this index.
+
+    Almost every prism knob defaults to automatic, so neither pg_class.reloptions
+    nor pg_settings says what the index actually uses; prism_index_settings()
+    reports the resolved values, which is what makes a run reproducible.
+    """
+    version, commit = conn.execute(
+        "SELECT pg_vectorsearch_version(), pg_vectorsearch_git_commit()").fetchone()
+    settings = {name: setting for name, setting, _source in conn.execute(
+        "SELECT * FROM prism_index_settings(%s::regclass)", (index_name,))}
+    return {"pg_vectorsearch_version": version,
+            "pg_vectorsearch_git": commit,
+            "prism_settings": settings}
 
 
 def pgvector_git_rev() -> str | None:
