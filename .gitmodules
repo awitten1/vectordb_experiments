@@ -5,3 +5,7 @@
 [submodule "pg_vectorsearch"]
 	path = pg_vectorsearch
 	url = git@github.com:awitten1/pg_vectorsearch.git
+[submodule "faiss"]
+	path = faiss
+	url = https://github.com/awitten1/faiss.git
+	ignore = untracked
