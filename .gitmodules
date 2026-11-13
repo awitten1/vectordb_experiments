@@ -1,7 +1,3 @@
-[submodule "pgvector"]
-	path = pgvector
-	url = https://github.com/pgvector/pgvector.git
-	ignore = untracked
 [submodule "pg_vectorsearch"]
 	path = pg_vectorsearch
 	url = git@github.com:awitten1/pg_vectorsearch.git
