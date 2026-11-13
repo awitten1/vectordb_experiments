@@ -5,3 +5,6 @@
 	path = faiss
 	url = https://github.com/awitten1/faiss.git
 	ignore = untracked
+[submodule "pgvector"]
+	path = pgvector
+	url = https://github.com/awitten1/pgvector.git
