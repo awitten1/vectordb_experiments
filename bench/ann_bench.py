@@ -80,7 +80,7 @@ def main() -> None:
         index_name, build = ensure_index(conn, ds, args)
         check_plan(conn, ds, args, index_name, test[0])
         server = conn.execute(
-            "SELECT current_setting('server_version'), extversion FROM pg_extension WHERE extname = 'vector'"
+            "SELECT current_setting('server_version'), extversion, current_setting('shared_preload_libraries') FROM pg_extension WHERE extname = 'vector'"
         ).fetchone()
         extra = prism_meta(conn, index_name) if args.index == "prism" else {}
 
@@ -99,6 +99,10 @@ def main() -> None:
         "postgres_version": server[0],
         "pgvector_version": server[1],
         "pgvector_git": pgvector_git_rev(),
+        "vector_so": vector_so_digest(),
+        "preload": server[2] or None,
+        "label": os.environ.get("BENCH_LABEL") or None,
+        "settings": EXTRA_SETTINGS or None,
         **extra,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
@@ -148,6 +152,9 @@ def parse_args() -> argparse.Namespace:
     b.add_argument("--maintenance-work-mem", default="2GB", help="for CREATE INDEX (default: 2GB)")
     b.add_argument("--parallel-workers", type=int, default=7,
                    help="max_parallel_maintenance_workers for CREATE INDEX (default: 7)")
+    b.add_argument("--rabitq-bits", type=int, default=0,
+                   help="HNSW only, experimental (awitten1/pgvector rabitq branch): store RaBitQ "
+                        "codes with this many bits per dimension instead of vectors (default: 0, off)")
     b.add_argument("--rebuild", action="store_true", help="rebuild the index even if it already exists")
     b.add_argument("--keep-other-indexes", action="store_true",
                    help="do not drop the table's other ANN indexes. Off by default because the "
@@ -172,9 +179,19 @@ def parse_args() -> argparse.Namespace:
     r.add_argument("--reload", action="store_true", help="drop and reload the table")
     r.add_argument("--dsn", default=DEFAULT_DSN, help=f"libpq connection string (default: {DEFAULT_DSN!r})")
     r.add_argument("--no-save", action="store_true", help="don't append results to bench/results/")
+    r.add_argument("--set", action="append", default=[], metavar="GUC=VALUE",
+                   help="extra setting for every connection, e.g. hnsw.rabitq_bits=4; "
+                        "repeatable, and recorded in the results")
 
     args = p.parse_args()
     args.sweep = args.sweep or DEFAULT_SWEEP[args.index]
+    for item in args.set:
+        name, sep, value = item.partition("=")
+        if not sep or not name.strip():
+            p.error(f"--set expects GUC=VALUE, got {item!r}")
+        EXTRA_SETTINGS[name.strip()] = value.strip()
+    if args.rabitq_bits and args.index != "hnsw":
+        p.error("--rabitq-bits only applies to --index hnsw")
     if args.index == "none" and args.sweep != "0":
         p.error("--sweep has no effect with --index none")
     return args
@@ -183,10 +200,21 @@ def parse_args() -> argparse.Namespace:
 # --- setup -------------------------------------------------------------------
 
 
+# GUCs from --set, applied on every connection (query workers inherit this via fork)
+EXTRA_SETTINGS: dict[str, str] = {}
+
+
 def connect(dsn: str) -> psycopg.Connection:
     conn = psycopg.connect(dsn, autocommit=True)
     conn.execute("SET client_min_messages = warning")
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    if EXTRA_SETTINGS:
+        # Load the library first so its GUCs exist: a typo, or a setting the
+        # installed vector.so doesn't define, then errors instead of silently
+        # becoming a placeholder
+        conn.execute("LOAD 'vector'")
+        for name, value in EXTRA_SETTINGS.items():
+            conn.execute("SELECT set_config(%s, %s, false)", (name, value))
     register_vector(conn)
     return conn
 
@@ -236,7 +264,10 @@ def binary_copy_rows(vectors: np.ndarray, first_id: int) -> bytes:
 
 def build_params(args: argparse.Namespace, rows: int) -> dict:
     if args.index == "hnsw":
-        return {"m": args.m, "ef_construction": args.ef_construction}
+        params = {"m": args.m, "ef_construction": args.ef_construction}
+        if args.rabitq_bits:
+            params["rabitq_bits"] = args.rabitq_bits
+        return params
     if args.index == "ivfflat":
         lists = args.lists or max(1, rows // 1000 if rows <= 1_000_000 else int(np.sqrt(rows)))
         return {"lists": lists}
@@ -467,6 +498,17 @@ def pgvector_git_rev() -> str | None:
     try:
         rev = git("rev-parse", "--short", "HEAD")
         return rev + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def vector_so_digest() -> str | None:
+    """Short SHA-256 of the installed vector.so. The submodule SHA says what the
+    source tree holds, which is not necessarily what the server loads."""
+    try:
+        pkglibdir = subprocess.run([str(REPO_ROOT / "postgres/install/bin/pg_config"), "--pkglibdir"],
+                                   capture_output=True, text=True, check=True).stdout.strip()
+        return hashlib.sha256(Path(pkglibdir, "vector.so").read_bytes()).hexdigest()[:12]
     except (OSError, subprocess.CalledProcessError):
         return None
 

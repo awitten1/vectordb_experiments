@@ -3,7 +3,7 @@
 # bench/results/ (one JSON line per sweep point) plus bench/profiles/.
 #
 # Usage: bench/run_experiment.sh [phase ...]          (no phase = all of them)
-#   phases: data build query concurrency profile build_prism compare ivfflat exact
+#   phases: data build query concurrency profile build_prism compare ivfflat exact rabitq
 #
 # NOTE ON ORDER: ann_bench.py keeps at most one vector index per table unless
 # --keep-other-indexes is passed. The ivfflat phase builds on its own copy of
@@ -28,6 +28,9 @@
 #   DURATION                           seconds per sweep point (default 60; 0 = one pass)
 #   EXACT_QUERIES                      queries for the exact baseline
 #   KEEP_RUNNING=1                     leave the server up at the end
+#   RABITQ_BITS, RQ_EF_SWEEP           rabitq phase: bit widths, ef_search sweep
+#   BENCH_ARGS                         extra ann_bench.py args for the query phase,
+#                                      e.g. "--set hnsw.rabitq_bits=4"
 #
 # Why this script exists rather than a list of commands in the report: the two
 # phases need *different* server configurations, and one of the settings is not
@@ -62,6 +65,10 @@ EXACT_QUERIES="${EXACT_QUERIES:-30}"     # each one scans the whole table
 # at 8 clients is ~3s, so startup costs and one-off stalls do not average out.
 DURATION="${DURATION:-60}"
 PROFILE_EF="${PROFILE_EF:-40}"
+RABITQ_BITS="${RABITQ_BITS:-1,2,4}"
+# Wider than EF_SWEEP: estimated distances cost recall, so matching plain
+# HNSW's recall needs a larger ef_search (1000 is pgvector's maximum)
+RQ_EF_SWEEP="${RQ_EF_SWEEP:-10,20,40,80,160,320,640,1000}"
 LOG_DIR="${LOG_DIR:-$BENCH/results}"
 # -----------------------------------------------------------------------------
 
@@ -297,8 +304,9 @@ phase_query() {
   start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0
   prewarm_or_die
   say "HNSW ef_search sweep ($EF_SWEEP), 1 client, ${DURATION}s per point"
+  # shellcheck disable=SC2086  # BENCH_ARGS is split on purpose
   bench --index hnsw $(index_args) --sweep "$EF_SWEEP" \
-        --num-queries "$NUM_QUERIES" --duration "$DURATION"
+        --num-queries "$NUM_QUERIES" --duration "$DURATION" ${BENCH_ARGS:-}
   report_sizes
 }
 
@@ -436,6 +444,213 @@ note: a flamegraph is only readable if Postgres and pgvector were built with
 MSG
 }
 
+# HNSW with RaBitQ codes stored instead of vectors (rabitq_bits index option,
+# awitten1/pgvector rabitq branch), against plain HNSW with the same binary.
+#
+# Each bit width gets its own copy of the table: every arm is an HNSW index on
+# the same operator, so on one table the planner would pick between them on
+# cost. The copies keep their indexes, so a rerun only re-measures.
+#
+# All builds happen first, then one restart into the query configuration and
+# every arm back to back. Plain HNSW runs first and last as a drift check.
+# Before each arm the whole buffer pool is evicted: the previous arm's pages
+# carry high usage counts, so the clock sweep would evict the freshly
+# prewarmed ones first and the residency assert would fail.
+phase_rabitq() {
+  local src t bits log_start
+  src="$(dataset_table)"
+
+  dsm_preflight
+  start_server "$BUILD_SB" "$BUILD_MWM"
+  for bits in ${RABITQ_BITS//,/ }; do
+    t="${src}_rq${bits}"
+    if [ "$("${PSQL[@]}" -At -c "SELECT count(*) FROM $t" 2>/dev/null || echo 0)" != \
+         "$("${PSQL[@]}" -At -c "SELECT count(*) FROM $src")" ]; then
+      say "copying $src -> $t (server-side)"
+      "${PSQL[@]}" -c "DROP TABLE IF EXISTS $t" >/dev/null
+      "${PSQL[@]}" -c "CREATE TABLE $t AS SELECT * FROM $src" >/dev/null
+      "${PSQL[@]}" -c "ANALYZE $t" >/dev/null
+    fi
+
+    say "building HNSW with ${bits}-bit RaBitQ codes on $t ($WORKERS workers)"
+    log_start=$(stat -c %s "$PGDATA_DIR/log")
+    bench --index hnsw $(index_args) --rabitq-bits "$bits" --table "$t" \
+          --maintenance-work-mem "$BUILD_MWM" --parallel-workers "$WORKERS" \
+          --sweep 40 --num-queries 100 ${REBUILD:+--rebuild} --no-save
+    if tail -c +$(( log_start + 1 )) "$PGDATA_DIR/log" | grep -qi 'no longer fits'; then
+      echo "warning: the graph spilled out of maintenance_work_mem; the rest was built" >&2
+      echo "         on disk with estimated distances. Raise BUILD_MWM." >&2
+    fi
+    report_sizes "$t"
+  done
+
+  start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0
+  for arm in 0 ${RABITQ_BITS//,/ } 0; do
+    if [ "$arm" = 0 ]; then t="$src"; else t="${src}_rq${arm}"; fi
+    "${PSQL[@]}" -c "SELECT pg_buffercache_evict_all()" >/dev/null
+    prewarm_or_die "$t"
+    say "HNSW rabitq_bits=$arm on $t: ef_search sweep ($RQ_EF_SWEEP), 1 client, ${DURATION}s per point"
+    bench --index hnsw $(index_args) --table "$t" \
+          $([ "$arm" != 0 ] && printf -- '--rabitq-bits %s' "$arm") \
+          --sweep "$RQ_EF_SWEEP" --num-queries "$NUM_QUERIES" --duration "$DURATION"
+  done
+}
+
+# Stock pgvector against pgvectorfast (pgvector 0.8.7 + the Calico buffer pool),
+# on the same HNSW index: pgvectorfast keeps pgvector's on-disk format.
+#
+# Calico has to be in shared_preload_libraries, so every arm restarts the
+# server -- stock arms too, so both pay the same cold-start cost. Arms repeat
+# (PVF_ARMS="stock fast stock fast") so that restart-to-restart noise shows up
+# as disagreement between rounds instead of passing for a difference.
+#
+# The database's vector functions are bound to $libdir/vector, not
+# $libdir/vectorfast, so the fast arm points vector.so at vectorfast.so with a
+# symlink. dfmgr matches libraries by inode, so the backend maps only
+# vectorfast.so, once. Requires a non-LTO Postgres (Calico refuses LTO builds).
+PVF_ARMS="${PVF_ARMS:-stock fast stock fast}"
+PVF_EF_SWEEP="${PVF_EF_SWEEP:-10,20,40,80,160,320,640,1000}"
+PVF_CLIENTS="${PVF_CLIENTS:-1,8}"
+STOCK_SO="${STOCK_SO:-}"                 # a stock pgvector vector.so (e.g. v0.8.7)
+FAST_SO="${FAST_SO:-$ROOT/pgvectorfast/vectorfast.so}"
+
+phase_pgvectorfast() {
+  [ -f "$STOCK_SO" ] || die "set STOCK_SO to a stock pgvector vector.so"
+  [ -f "$FAST_SO" ] || die "no $FAST_SO; build pgvectorfast first"
+  local lib; lib="$("$BIN/pg_config" --pkglibdir)"
+  [ -f "$("$BIN/pg_config" --sharedir)/extension/calico.control" ] ||
+    die "calico extension files not installed"
+  # grep -c, not -q: -q exits early and pipefail then sees nm's SIGPIPE.
+  [ "$(nm "$FAST_SO" | grep -c ' calico_')" -gt 0 ] || die "$FAST_SO has no calico symbols"
+  [ "$(nm "$STOCK_SO" | grep -c ' calico_' || true)" -eq 0 ] || die "$STOCK_SO has calico symbols"
+
+  local arm round=0 c preload
+  for arm in $PVF_ARMS; do
+    round=$(( round + 1 ))
+    stop_server
+    rm -f "$lib/vector.so"
+    case "$arm" in
+      stock) install -m755 "$STOCK_SO" "$lib/vector.so"; preload="" ;;
+      fast)  install -m755 "$FAST_SO" "$lib/vectorfast.so"
+             ln -s vectorfast.so "$lib/vector.so"
+             preload="-c shared_preload_libraries=vectorfast" ;;
+      *) die "unknown arm '$arm' (want stock or fast)" ;;
+    esac
+    # shellcheck disable=SC2086  # preload is split on purpose
+    start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0 $preload
+    if [ "$arm" = fast ]; then
+      "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS calico" -c "CALL calico.activate()" >/dev/null
+      [ "$("${PSQL[@]}" -At -c 'SELECT calico.status()')" = calico ] ||
+        die "calico did not activate"
+    fi
+    prewarm_or_die
+    for c in ${PVF_CLIENTS//,/ }; do
+      say "arm $round ($arm): HNSW ef_search sweep ($PVF_EF_SWEEP), $c client(s), ${DURATION}s per point"
+      BENCH_LABEL="pvf-$arm-r$round" \
+        bench --index hnsw $(index_args) --sweep "$PVF_EF_SWEEP" --clients "$c" \
+              --num-queries "$NUM_QUERIES" --duration "$DURATION"
+    done
+  done
+}
+
+# Ablation of pgvectorfast's speedup over stock pgvector, one layer at a time,
+# on the same HNSW index:
+#   A0  stock pgvector (STOCK_SO), no preload
+#   A1  vectorfast.so, NOT preloaded: Calico never installs, so this is the
+#       rewritten HNSW search loop + SIMD kernels on Postgres's own buffer manager
+#       (hnsw.enable_prefetch=off; its batching rides on Calico's lookups anyway)
+#   A2  Calico preloaded + active, calico.optimistic_reads=off, prefetch off:
+#       adds array page translation, still pinning and locking
+#   A3  A2 + optimistic_reads=on: no pins or content locks on traversal
+#   A4  A3 + hnsw.enable_prefetch=on: the full pgvectorfast
+# The server restarts only when the library or preload changes (A0 | A1 | A2-4).
+# If perf is allowed (perf_event_paranoid <= 1), each arm also gets a 1-client
+# window at PVA_PERF_EF under `perf stat -I` and a flat `perf record`, saved to
+# bench/profiles/ablation/.
+PVA_ARMS="${PVA_ARMS:-A0 A1 A2 A3 A4}"
+PVA_EF_SWEEP="${PVA_EF_SWEEP:-10,40,160}"
+PVA_CLIENTS="${PVA_CLIENTS:-1,8}"
+PVA_PERF_EF="${PVA_PERF_EF:-40}"
+PVA_PERF_S="${PVA_PERF_S:-40}"
+
+pva_perf_window() {
+  local arm="$1"; shift
+  local out="$BENCH/profiles/ablation" pm pstat prec
+  if [ "$(cat /proc/sys/kernel/perf_event_paranoid)" -gt 1 ]; then
+    echo "perf_event_paranoid > 1; skipping the perf window for $arm" >&2
+    return
+  fi
+  mkdir -p "$out"
+  pm="$(head -1 "$PGDATA_DIR/postmaster.pid")"
+  say "arm $arm: perf window, ef_search=$PVA_PERF_EF, 1 client, ${PVA_PERF_S}s"
+  perf stat -I 2000 -x, -e cycles,instructions,cache-misses,branch-misses \
+    -p "$pm" -o "$out/$arm.stat.csv" 2>/dev/null &
+  pstat=$!
+  perf record -F 999 -p "$pm" -o "$out/$arm.perf.data" >/dev/null 2>&1 &
+  prec=$!
+  sleep 1
+  BENCH_LABEL="pva-$arm-perf" \
+    bench --index hnsw $(index_args) --sweep "$PVA_PERF_EF" --clients 1 \
+          --num-queries "$NUM_QUERIES" --duration "$PVA_PERF_S" --no-save "$@" \
+    | tee "$out/$arm.bench.txt"
+  kill -INT "$pstat" "$prec" 2>/dev/null || true
+  wait "$pstat" "$prec" 2>/dev/null || true
+}
+
+phase_pvf_ablation() {
+  [ -f "$STOCK_SO" ] || die "set STOCK_SO to a stock pgvector vector.so"
+  [ -f "$FAST_SO" ] || die "no $FAST_SO; build pgvectorfast first"
+  local lib; lib="$("$BIN/pg_config" --pkglibdir)"
+  [ "$(nm "$FAST_SO" | grep -c ' calico_')" -gt 0 ] || die "$FAST_SO has no calico symbols"
+  [ "$(nm "$STOCK_SO" | grep -c ' calico_' || true)" -eq 0 ] || die "$STOCK_SO has calico symbols"
+
+  local arm group cur="" c
+  local -a sets
+  for arm in $PVA_ARMS; do
+    case "$arm" in
+      A0) group=stock; sets=() ;;
+      A1) group=fast-nopreload; sets=(--set hnsw.enable_prefetch=off) ;;
+      A2) group=fast-calico; sets=(--set calico.optimistic_reads=off --set hnsw.enable_prefetch=off) ;;
+      A3) group=fast-calico; sets=(--set calico.optimistic_reads=on --set hnsw.enable_prefetch=off) ;;
+      A4) group=fast-calico; sets=(--set calico.optimistic_reads=on --set hnsw.enable_prefetch=on) ;;
+      *) die "unknown arm '$arm' (want A0..A4)" ;;
+    esac
+    if [ "$group" != "$cur" ]; then
+      stop_server
+      rm -f "$lib/vector.so"
+      if [ "$group" = stock ]; then
+        install -m755 "$STOCK_SO" "$lib/vector.so"
+      else
+        install -m755 "$FAST_SO" "$lib/vectorfast.so"
+        ln -s vectorfast.so "$lib/vector.so"
+      fi
+      if [ "$group" = fast-calico ]; then
+        start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0 \
+                     -c shared_preload_libraries=vectorfast
+        "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS calico" -c "CALL calico.activate()" >/dev/null
+        [ "$("${PSQL[@]}" -At -c 'SELECT calico.status()')" = calico ] || die "calico did not activate"
+      else
+        start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0
+        # Never call calico.status() under the stock library: it would dlopen
+        # vectorfast.so next to vector.so and register the hnsw.* GUCs twice.
+        if [ "$group" = fast-nopreload ]; then
+          [ "$("${PSQL[@]}" -At -c 'SELECT calico.status()')" = not_preloaded ] ||
+            die "expected calico to be inactive in $arm"
+        fi
+      fi
+      prewarm_or_die
+      cur="$group"
+    fi
+    for c in ${PVA_CLIENTS//,/ }; do
+      say "arm $arm ($group ${sets[*]}): ef_search $PVA_EF_SWEEP, $c client(s), ${DURATION}s per point"
+      BENCH_LABEL="pva-$arm" \
+        bench --index hnsw $(index_args) --sweep "$PVA_EF_SWEEP" --clients "$c" \
+              --num-queries "$NUM_QUERIES" --duration "$DURATION" "${sets[@]}"
+    done
+    pva_perf_window "$arm" "${sets[@]}"
+  done
+}
+
 # ---- main -------------------------------------------------------------------
 
 [ -x "$PY" ] || die "no venv at $PY; create it with: python3 -m venv bench/.venv && bench/.venv/bin/pip install -r bench/requirements.txt"
@@ -454,8 +669,8 @@ printf 'phases: %s\n' "${PHASES[*]}" >&2
 START=$SECONDS
 for p in "${PHASES[@]}"; do
   case "$p" in
-    data|build|query|concurrency|ivfflat|exact|profile|compare|build_prism) "phase_$p" ;;
-    *) die "unknown phase '$p' (want: data build query concurrency profile build_prism compare ivfflat exact)" ;;
+    data|build|query|concurrency|ivfflat|exact|profile|compare|build_prism|rabitq|pgvectorfast|pvf_ablation) "phase_$p" ;;
+    *) die "unknown phase '$p' (want: data build query concurrency profile build_prism compare ivfflat exact rabitq pgvectorfast pvf_ablation)" ;;
   esac
 done
 

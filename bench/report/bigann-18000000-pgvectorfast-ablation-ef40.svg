@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 560" width="1060" height="560" role="img" aria-labelledby="t d" font-family="Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+<title id="t">Where pgvectorfast's speedup comes from</title>
+<desc id="d">stock pgvector 0.8.7: 1,099 QPS at 1 client, 7,895 at 8, 5.07M cycles and 1.95M instructions per query; + rewritten search loop, SIMD: 1,134 QPS at 1 client, 7,866 at 8, 4.92M cycles and 1.85M instructions per query; + Calico page translation: 1,780 QPS at 1 client, 11,624 at 8, 3.11M cycles and 1.64M instructions per query; + optimistic reads (no pins, locks): 3,223 QPS at 1 client, 17,760 at 8, 1.70M cycles and 0.65M instructions per query; + neighbour prefetch  = pgvectorfast: 9,476 QPS at 1 client, 37,876 at 8, 0.54M cycles and 0.71M instructions per query</desc>
+<style>
+:root{--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--bar:#2a78d6}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--bar:#3987e5}}
+:root[data-theme="dark"]{--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--bar:#3987e5}
+.bg{fill:var(--surface)} .ttl{fill:var(--ink);font-size:19px;font-weight:600}.sub{fill:var(--ink2);font-size:12.5px} .foot{fill:var(--muted);font-size:11.5px}.ptl{fill:var(--ink);font-size:13px;font-weight:600}.row{fill:var(--ink);font-size:12.5px;font-weight:500}.tick{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}.val{fill:var(--ink);font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}.note{fill:var(--muted);font-weight:500}.grid{stroke:var(--grid);stroke-width:1} .axis{stroke:var(--axis);stroke-width:1}.bar{fill:var(--bar)} .bar:hover{opacity:.8}
+</style>
+<rect class="bg" x="0" y="0" width="1060" height="560"/>
+<text class="ttl" x="24" y="34">Where pgvectorfast's speedup over pgvector comes from</text>
+<text class="sub" x="24" y="56">HNSW on 18M BIGANN, ef_search=40, recall 0.855 in every arm · each row adds one layer to the row above · same index, fully in shared_buffers</text>
+<text class="sub" x="24" y="74">Grey figures are the step over the row above. Hover a bar for its value.</text>
+<text class="row" x="254" y="137.0" text-anchor="end">stock pgvector 0.8.7</text>
+<text class="row" x="254" y="167.0" text-anchor="end">+ rewritten search loop, SIMD</text>
+<text class="row" x="254" y="197.0" text-anchor="end">+ Calico page translation</text>
+<text class="row" x="254" y="227.0" text-anchor="end">+ optimistic reads (no pins, locks)</text>
+<text class="row" x="254" y="257.0" text-anchor="end">+ neighbour prefetch  = pgvectorfast</text>
+<text class="row" x="254" y="361.0" text-anchor="end">stock pgvector 0.8.7</text>
+<text class="row" x="254" y="391.0" text-anchor="end">+ rewritten search loop, SIMD</text>
+<text class="row" x="254" y="421.0" text-anchor="end">+ Calico page translation</text>
+<text class="row" x="254" y="451.0" text-anchor="end">+ optimistic reads (no pins, locks)</text>
+<text class="row" x="254" y="481.0" text-anchor="end">+ neighbour prefetch  = pgvectorfast</text>
+<text class="ptl" x="268" y="104">Queries per second, 1 client</text>
+<line class="grid" x1="268.0" y1="118" x2="268.0" y2="268"/>
+<text class="tick" x="268.0" y="283" text-anchor="middle">0</text>
+<line class="grid" x1="333.0" y1="118" x2="333.0" y2="268"/>
+<text class="tick" x="333.0" y="283" text-anchor="middle">2.5k</text>
+<line class="grid" x1="398.0" y1="118" x2="398.0" y2="268"/>
+<text class="tick" x="398.0" y="283" text-anchor="middle">5k</text>
+<line class="grid" x1="463.0" y1="118" x2="463.0" y2="268"/>
+<text class="tick" x="463.0" y="283" text-anchor="middle">7.5k</text>
+<line class="grid" x1="528.0" y1="118" x2="528.0" y2="268"/>
+<text class="tick" x="528.0" y="283" text-anchor="middle">10k</text>
+<path class="bar" d="M268.0,124.0h24.6a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-24.6z"><title>stock pgvector 0.8.7: 1,099 QPS</title></path>
+<text class="val" x="302.6" y="137.0">1,099</text>
+<path class="bar" d="M268.0,154.0h25.5a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-25.5z"><title>+ rewritten search loop, SIMD: 1,134 QPS×1.03</title></path>
+<text class="val" x="303.5" y="167.0">1,134<tspan class="note"> ×1.03</tspan></text>
+<path class="bar" d="M268.0,184.0h42.3a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-42.3z"><title>+ Calico page translation: 1,780 QPS×1.57</title></path>
+<text class="val" x="320.3" y="197.0">1,780<tspan class="note"> ×1.57</tspan></text>
+<path class="bar" d="M268.0,214.0h79.8a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-79.8z"><title>+ optimistic reads (no pins, locks): 3,223 QPS×1.81</title></path>
+<text class="val" x="357.8" y="227.0">3,223<tspan class="note"> ×1.81</tspan></text>
+<path class="bar" d="M268.0,244.0h242.4a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-242.4z"><title>+ neighbour prefetch  = pgvectorfast: 9,476 QPS×2.94</title></path>
+<text class="val" x="520.4" y="257.0">9,476<tspan class="note"> ×2.94</tspan></text>
+<line class="axis" x1="268" y1="118" x2="268" y2="268"/>
+<text class="ptl" x="658" y="104">Queries per second, 8 clients</text>
+<line class="grid" x1="658.0" y1="118" x2="658.0" y2="268"/>
+<text class="tick" x="658.0" y="283" text-anchor="middle">0</text>
+<line class="grid" x1="723.0" y1="118" x2="723.0" y2="268"/>
+<text class="tick" x="723.0" y="283" text-anchor="middle">10k</text>
+<line class="grid" x1="788.0" y1="118" x2="788.0" y2="268"/>
+<text class="tick" x="788.0" y="283" text-anchor="middle">20k</text>
+<line class="grid" x1="853.0" y1="118" x2="853.0" y2="268"/>
+<text class="tick" x="853.0" y="283" text-anchor="middle">30k</text>
+<line class="grid" x1="918.0" y1="118" x2="918.0" y2="268"/>
+<text class="tick" x="918.0" y="283" text-anchor="middle">40k</text>
+<path class="bar" d="M658.0,124.0h47.3a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-47.3z"><title>stock pgvector 0.8.7: 7,895 QPS</title></path>
+<text class="val" x="715.3" y="137.0">7,895</text>
+<path class="bar" d="M658.0,154.0h47.1a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-47.1z"><title>+ rewritten search loop, SIMD: 7,866 QPS×1.00</title></path>
+<text class="val" x="715.1" y="167.0">7,866<tspan class="note"> ×1.00</tspan></text>
+<path class="bar" d="M658.0,184.0h71.6a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-71.6z"><title>+ Calico page translation: 11,624 QPS×1.48</title></path>
+<text class="val" x="739.6" y="197.0">11,624<tspan class="note"> ×1.48</tspan></text>
+<path class="bar" d="M658.0,214.0h111.4a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-111.4z"><title>+ optimistic reads (no pins, locks): 17,760 QPS×1.53</title></path>
+<text class="val" x="779.4" y="227.0">17,760<tspan class="note"> ×1.53</tspan></text>
+<path class="bar" d="M658.0,244.0h242.2a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-242.2z"><title>+ neighbour prefetch  = pgvectorfast: 37,876 QPS×2.13</title></path>
+<text class="val" x="910.2" y="257.0">37,876<tspan class="note"> ×2.13</tspan></text>
+<line class="axis" x1="658" y1="118" x2="658" y2="268"/>
+<text class="ptl" x="268" y="328">CPU cycles per query (millions), 1 client</text>
+<line class="grid" x1="268.0" y1="342" x2="268.0" y2="492"/>
+<text class="tick" x="268.0" y="507" text-anchor="middle">0</text>
+<line class="grid" x1="333.0" y1="342" x2="333.0" y2="492"/>
+<text class="tick" x="333.0" y="507" text-anchor="middle">1.5</text>
+<line class="grid" x1="398.0" y1="342" x2="398.0" y2="492"/>
+<text class="tick" x="398.0" y="507" text-anchor="middle">3</text>
+<line class="grid" x1="463.0" y1="342" x2="463.0" y2="492"/>
+<text class="tick" x="463.0" y="507" text-anchor="middle">4.5</text>
+<line class="grid" x1="528.0" y1="342" x2="528.0" y2="492"/>
+<text class="tick" x="528.0" y="507" text-anchor="middle">6</text>
+<path class="bar" d="M268.0,348.0h215.6a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-215.6z"><title>stock pgvector 0.8.7: 5.07M cycles per query</title></path>
+<text class="val" x="493.6" y="361.0">5.07M</text>
+<path class="bar" d="M268.0,378.0h209.4a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-209.4z"><title>+ rewritten search loop, SIMD: 4.92M cycles per query÷1.03</title></path>
+<text class="val" x="487.4" y="391.0">4.92M<tspan class="note"> ÷1.03</tspan></text>
+<path class="bar" d="M268.0,408.0h130.8a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-130.8z"><title>+ Calico page translation: 3.11M cycles per query÷1.58</title></path>
+<text class="val" x="408.8" y="421.0">3.11M<tspan class="note"> ÷1.58</tspan></text>
+<path class="bar" d="M268.0,438.0h69.6a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-69.6z"><title>+ optimistic reads (no pins, locks): 1.70M cycles per query÷1.83</title></path>
+<text class="val" x="347.6" y="451.0">1.70M<tspan class="note"> ÷1.83</tspan></text>
+<path class="bar" d="M268.0,468.0h19.6a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-19.6z"><title>+ neighbour prefetch  = pgvectorfast: 0.54M cycles per query÷3.12</title></path>
+<text class="val" x="297.6" y="481.0">0.54M<tspan class="note"> ÷3.12</tspan></text>
+<line class="axis" x1="268" y1="342" x2="268" y2="492"/>
+<text class="ptl" x="658" y="328">Instructions per query (millions), 1 client</text>
+<line class="grid" x1="658.0" y1="342" x2="658.0" y2="492"/>
+<text class="tick" x="658.0" y="507" text-anchor="middle">0</text>
+<line class="grid" x1="723.0" y1="342" x2="723.0" y2="492"/>
+<text class="tick" x="723.0" y="507" text-anchor="middle">0.5</text>
+<line class="grid" x1="788.0" y1="342" x2="788.0" y2="492"/>
+<text class="tick" x="788.0" y="507" text-anchor="middle">1</text>
+<line class="grid" x1="853.0" y1="342" x2="853.0" y2="492"/>
+<text class="tick" x="853.0" y="507" text-anchor="middle">1.5</text>
+<line class="grid" x1="918.0" y1="342" x2="918.0" y2="492"/>
+<text class="tick" x="918.0" y="507" text-anchor="middle">2</text>
+<path class="bar" d="M658.0,348.0h249.3a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-249.3z"><title>stock pgvector 0.8.7: 1.95M instructions per query · IPC 0.38</title></path>
+<text class="val" x="917.3" y="361.0">1.95M<tspan class="note"> IPC 0.38</tspan></text>
+<path class="bar" d="M658.0,378.0h236.2a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-236.2z"><title>+ rewritten search loop, SIMD: 1.85M instructions per query · IPC 0.38</title></path>
+<text class="val" x="904.2" y="391.0">1.85M<tspan class="note"> IPC 0.38</tspan></text>
+<path class="bar" d="M658.0,408.0h209.0a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-209.0z"><title>+ Calico page translation: 1.64M instructions per query · IPC 0.53</title></path>
+<text class="val" x="877.0" y="421.0">1.64M<tspan class="note"> IPC 0.53</tspan></text>
+<path class="bar" d="M658.0,438.0h80.3a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-80.3z"><title>+ optimistic reads (no pins, locks): 0.65M instructions per query · IPC 0.38</title></path>
+<text class="val" x="748.3" y="451.0">0.65M<tspan class="note"> IPC 0.38</tspan></text>
+<path class="bar" d="M658.0,468.0h88.5a4,4 0 0 1 4,4v10.0a4,4 0 0 1 -4,4h-88.5z"><title>+ neighbour prefetch  = pgvectorfast: 0.71M instructions per query · IPC 1.31</title></path>
+<text class="val" x="756.5" y="481.0">0.71M<tspan class="note"> IPC 1.31</tspan></text>
+<line class="axis" x1="658" y1="342" x2="658" y2="492"/>
+<text class="foot" x="24" y="530">Optimistic reads cut instructions ~60%; prefetch leaves instructions and cache misses (~25k/query) unchanged but lifts instructions per cycle (IPC) 0.38 → 1.31 by overlapping misses.</text>
+<text class="foot" x="24" y="548">Postgres 18.6 · pgvector 0.8.7 vs pgvectorfast a704e32 · 60s per QPS point · counters: perf stat over a 40s 1-client window, steady-state median, multiplexed (scaled) · AMD Ryzen 9 9900X</text>
+</svg>
