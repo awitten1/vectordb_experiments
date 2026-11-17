@@ -8,3 +8,6 @@
 [submodule "pgvector"]
 	path = pgvector
 	url = https://github.com/awitten1/pgvector.git
+[submodule "pgvectorfast"]
+	path = pgvectorfast
+	url = https://github.com/awitten1/pgvectorfast.git
