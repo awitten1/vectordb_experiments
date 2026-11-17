@@ -11,3 +11,6 @@
 [submodule "pgvectorfast"]
 	path = pgvectorfast
 	url = https://github.com/awitten1/pgvectorfast.git
+[submodule "ginger"]
+	path = ginger
+	url = https://github.com/awitten1/ginger.git
