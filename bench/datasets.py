@@ -13,6 +13,11 @@ Two kinds of dataset names are supported:
       the official query file and exact neighbors are computed locally over
       the chosen prefix.
 
+  qdrant:<name>                   e.g. qdrant:dbpedia-openai-1M-1536-angular
+      A set from Qdrant's vector-db-benchmark (see QDRANT_SETS). Served under
+      L2 after asserting unit norms; exact top-100 is recomputed locally and
+      checked against the published top-10.
+
   <ann-benchmarks name>           e.g. sift-128-euclidean, glove-100-angular
       Downloaded once from ann-benchmarks.com into bench/data/. These files
       ship with precomputed exact neighbors.
@@ -96,6 +101,8 @@ def load(name: str, seed: int = 42, num_queries: int = 1000) -> Dataset:
         return _load_synthetic(name, seed, num_queries)
     if name.startswith("bigann:"):
         return _load_bigann(name, num_queries)
+    if name.startswith("qdrant:"):
+        return _load_qdrant(name, num_queries)
     return _load_ann_benchmarks(name)
 
 
@@ -294,6 +301,144 @@ def exact_neighbors(train: np.ndarray, test: np.ndarray, metric: str, k: int) ->
 
     order = np.argsort(best_d, axis=1, kind="stable")
     return np.take_along_axis(best_i, order, axis=1)
+
+
+# --- Qdrant vector-db-benchmark sets -----------------------------------------
+
+QDRANT_URL = "https://storage.googleapis.com/ann-filtered-benchmark/datasets/{file}"
+
+# name -> tarball. Names follow qdrant/vector-db-benchmark datasets/datasets.json.
+# Each tarball holds exactly vectors.npy (float32 [n, d]) and tests.jsonl (one
+# {"query", "conditions", "closest_ids", "closest_scores"} object per line).
+QDRANT_SETS = {
+    "dbpedia-openai-1M-1536-angular": "dbpedia_openai_1M.tgz",
+    "dbpedia-openai-100K-1536-angular": "dbpedia_openai_100K.tgz",
+}
+QDRANT_MEMBERS = {"vectors.npy", "tests.jsonl"}
+
+# How far a vector's norm may stray from 1 before we refuse to treat cosine as L2.
+UNIT_NORM_TOL = 1e-3
+
+
+def _load_qdrant(name: str, num_queries: int) -> Dataset:
+    """A Qdrant benchmark set, served under L2.
+
+    These sets are published as cosine. OpenAI ada-002 embeddings are
+    unit-normalized, and for unit vectors |q-x|^2 = 2 - 2 q.x, so L2, cosine
+    and inner product produce the same ranking. Serving them as L2 lets every
+    engine in the comparison compute the same metric (Ginger has no cosine);
+    the unit norms are asserted here rather than assumed.
+
+    The published ground truth is only the top 10 under cosine. Exact top-GT_K
+    is recomputed under L2 and compared against it as a sanity check.
+    """
+    key = name.split(":", 1)[1]
+    if key not in QDRANT_SETS:
+        raise ValueError(f"unknown qdrant dataset {key!r}, expected one of {list(QDRANT_SETS)}")
+    full_name = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+    metric = "euclidean"
+    train_path = DATA_DIR / f"{full_name}_train.npy"
+    meta_path = DATA_DIR / f"{full_name}_meta.npz"
+
+    if train_path.exists() and meta_path.exists():
+        z = np.load(meta_path)
+        if len(z["test"]) >= num_queries:
+            train = np.load(train_path, mmap_mode="r")
+            return Dataset(full_name, train, z["test"], z["neighbors"], metric)
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    src = DATA_DIR / f"{full_name}_src"
+    if not (src / "tests.jsonl").exists() or not (train_path.exists() or (src / "vectors.npy").exists()):
+        tarball = DATA_DIR / QDRANT_SETS[key]
+        if not tarball.exists():
+            _download(QDRANT_URL.format(file=QDRANT_SETS[key]), tarball)
+        _extract_qdrant(tarball, src)
+
+    if not train_path.exists():
+        # The published file is already a C-ordered <f4 .npy; check, then adopt it as is.
+        v = np.load(src / "vectors.npy", mmap_mode="r")
+        if v.dtype != np.float32 or v.ndim != 2 or not v.flags.c_contiguous:
+            raise ValueError(f"{src}/vectors.npy: expected C-ordered float32 [n, d], got {v.dtype} {v.shape}")
+        del v
+        (src / "vectors.npy").rename(train_path)
+    train = np.load(train_path, mmap_mode="r")
+
+    import json
+    queries, published = [], []
+    with (src / "tests.jsonl").open() as f:
+        for line in f:
+            t = json.loads(line)
+            if t.get("conditions"):
+                raise ValueError(f"{key}: test {len(queries)} has filter conditions; this loader is unfiltered only")
+            queries.append(t["query"])
+            published.append(t["closest_ids"])
+    if num_queries > len(queries):
+        raise ValueError(f"{key} has {len(queries)} test queries, asked for {num_queries}")
+    test = np.asarray(queries[:num_queries], dtype=np.float32)
+    published = published[:num_queries]
+    if test.shape[1] != train.shape[1]:
+        raise ValueError(f"{key}: query dim {test.shape[1]} != base dim {train.shape[1]}")
+
+    _assert_unit_norm(train, f"{key} base vectors")
+    _assert_unit_norm(test, f"{key} queries")
+
+    print(f"computing exact L2 neighbors for {len(test)} queries over {len(train)} vectors ...", file=sys.stderr)
+    neighbors = exact_neighbors(train, test, metric, min(GT_K, len(train)))
+
+    # Queries drawn from the base set would hand every engine a free hit at
+    # distance 0. Report it either way; refuse rather than silently patch it.
+    d0 = np.linalg.norm(np.asarray(train[neighbors[:, 0]], dtype=np.float32) - test, axis=1)
+    dup = int((d0 < 1e-6).sum())
+    print(f"  queries identical to a base vector: {dup} of {len(test)}", file=sys.stderr)
+    if dup:
+        raise ValueError(f"{key}: {dup} queries are also base vectors; the query set is not held out")
+
+    # Published ids are row indexes into vectors.npy (the archive carries no id
+    # column), so they are directly comparable.
+    k = min(10, min(len(p) for p in published))
+    overlap = np.mean([len(set(neighbors[i, :k].tolist()) & set(published[i][:k])) / k
+                       for i in range(len(test))])
+    print(f"  top-{k} agreement with the published ground truth: {overlap:.4f}", file=sys.stderr)
+    if overlap < 0.99:
+        print(f"  warning: published and recomputed neighbors disagree more than float32 ties explain",
+              file=sys.stderr)
+
+    np.savez(meta_path, test=test, neighbors=neighbors, published_top10_agreement=np.float64(overlap))
+    return Dataset(full_name, train, test, neighbors, metric)
+
+
+def _extract_qdrant(tarball: Path, dest: Path) -> None:
+    """Extract exactly the expected members into a fresh directory."""
+    import shutil
+    import tarfile
+
+    tmp = dest.with_name(dest.name + ".part")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    with tarfile.open(tarball, "r:gz") as tf:
+        members = [m for m in tf.getmembers() if not m.isdir()]
+        names = {Path(m.name).name for m in members}
+        if names != QDRANT_MEMBERS or any(not m.isfile() for m in members):
+            raise ValueError(f"{tarball.name}: expected regular files {sorted(QDRANT_MEMBERS)}, "
+                             f"found {sorted(m.name for m in members)}")
+        print(f"extracting {tarball.name} ...", file=sys.stderr)
+        for m in members:
+            # Flatten paths: never let a member name choose where it lands.
+            with tf.extractfile(m) as fin, (tmp / Path(m.name).name).open("wb") as fout:
+                shutil.copyfileobj(fin, fout, 1 << 24)
+    shutil.rmtree(dest, ignore_errors=True)
+    tmp.rename(dest)
+
+
+def _assert_unit_norm(x: np.ndarray, what: str) -> None:
+    worst = 0.0
+    for start in range(0, len(x), GEN_CHUNK):
+        n = np.linalg.norm(np.asarray(x[start : start + GEN_CHUNK], dtype=np.float32), axis=1)
+        worst = max(worst, float(np.abs(n - 1.0).max()))
+    print(f"  {what}: max |norm - 1| = {worst:.2e}", file=sys.stderr)
+    if worst > UNIT_NORM_TOL:
+        raise ValueError(f"{what} are not unit-normalized (max |norm-1| = {worst:.3g}); "
+                         f"L2 would not rank like cosine")
 
 
 # --- ann-benchmarks ----------------------------------------------------------

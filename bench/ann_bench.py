@@ -15,6 +15,7 @@ import hashlib
 import json
 import multiprocessing as mp
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -33,9 +34,16 @@ RESULTS_DIR = BENCH_DIR / "results"
 
 DEFAULT_DSN = f"host=localhost port={os.environ.get('PGPORT', '5432')} user=postgres dbname=postgres"
 DEFAULT_SWEEP = {"hnsw": "10,20,40,80,160,320", "ivfflat": "1,2,4,8,16,32,64",
-                 "prism": "5,10,20,40,80,160,320", "none": "0"}
+                 "prism": "5,10,20,40,80,160,320", "none": "0", "rtt": "0"}
 SEARCH_GUC = {"hnsw": "hnsw.ef_search", "ivfflat": "ivfflat.probes",
-              "prism": "prism.nprobe", "none": None}
+              "prism": "prism.nprobe", "none": None, "rtt": None}
+
+# --index rtt: the per-query cost of the Postgres boundary with no search at
+# all. Same client, same prepared-statement path and the same vector parameter
+# (parsed by vector_in on the server) as a real ANN query, but the plan is a
+# Result node. Subtracting it from an ANN query's latency leaves the index's
+# share, which is what an in-process library like Ginger or FAISS pays alone.
+RTT_QUERY = "SELECT 0::bigint FROM (SELECT %s::vector AS v) s WHERE s.v IS NOT NULL"
 INDEX_AMS = ("hnsw", "ivfflat", "prism")
 
 # PRISM declares its opclasses for its own vec32 type. The type is binary
@@ -65,6 +73,8 @@ def order_by(ds, index: str) -> str:
 
 def main() -> None:
     args = parse_args()
+    if os.environ.get("REQUIRE_NO_SWAP") == "1":
+        require_no_swap()
     ds = datasets.load(args.dataset, seed=args.seed, num_queries=args.num_queries)
     ds.table_override = args.table
     if args.k > ds.neighbors.shape[1]:
@@ -76,12 +86,17 @@ def main() -> None:
     with connect(args.dsn) as conn:
         if args.index == "prism":
             conn.execute("CREATE EXTENSION IF NOT EXISTS pg_vectorsearch")
-        load_table(conn, ds, args.reload)
-        index_name, build = ensure_index(conn, ds, args)
-        check_plan(conn, ds, args, index_name, test[0])
+        if args.index == "rtt":
+            # No table and no index: only the boundary is measured.
+            index_name, build = None, {"build_s": None, "index_bytes": None, "parallel_workers": None}
+        else:
+            load_table(conn, ds, args.reload)
+            index_name, build = ensure_index(conn, ds, args)
+            check_plan(conn, ds, args, index_name, test[0])
         server = conn.execute(
             "SELECT current_setting('server_version'), extversion, current_setting('shared_preload_libraries') FROM pg_extension WHERE extname = 'vector'"
         ).fetchone()
+        server_host = conn.info.host
         extra = prism_meta(conn, index_name) if args.index == "prism" else {}
 
     meta = {
@@ -99,9 +114,13 @@ def main() -> None:
         "postgres_version": server[0],
         "pgvector_version": server[1],
         "pgvector_git": pgvector_git_rev(),
-        "vector_so": vector_so_digest(),
+        # The digest reads this machine's install, so it only describes the
+        # server when the server is this machine.
+        "vector_so": vector_so_digest() if server_is_local(server_host) else None,
+        "server_host": server_host,
         "preload": server[2] or None,
         "label": os.environ.get("BENCH_LABEL") or None,
+        "host": socket.gethostname(),
         "settings": EXTRA_SETTINGS or None,
         **extra,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -114,13 +133,19 @@ def main() -> None:
     for value in sweep:
         if args.index == "hnsw" and value < args.k:
             log(f"warning: ef_search={value} < k={args.k}; HNSW returns at most ef_search rows")
-        with connect(args.dsn) as conn:
-            check_plan(conn, ds, args, index_name, test[0], guc, value)
+        if args.index != "rtt":
+            with connect(args.dsn) as conn:
+                check_plan(conn, ds, args, index_name, test[0], guc, value)
+        vm_before = vmstat()
         ids, latencies_ns, wall_ns, executed = run_queries(
             args.dsn, ds, test, args.k, guc, value, args.clients, args.duration,
             index=args.index)
+        mem = memory_check(args, ds, vm_before)
         result = {**meta, "search_param": guc, "search_value": value if guc else None,
-                  **summarize(ids, neighbors, args.k, latencies_ns, wall_ns, executed)}
+                  **summarize(ids, neighbors, args.k, latencies_ns, wall_ns, executed),
+                  "memory": mem}
+        if args.index == "rtt":
+            result["recall"] = None  # nothing was searched
         rows.append(result)
         print_row(result)
 
@@ -137,8 +162,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset", required=True,
                    help="synthetic:<n>x<d>[:<metric>] or an ann-benchmarks name such as sift-128-euclidean")
-    p.add_argument("--index", choices=["hnsw", "ivfflat", "prism", "none"], default="hnsw",
-                   help="index to benchmark; 'none' runs exact sequential scans (default: hnsw)")
+    p.add_argument("--index", choices=["hnsw", "ivfflat", "prism", "none", "rtt"], default="hnsw",
+                   help="index to benchmark; 'none' runs exact sequential scans; 'rtt' measures "
+                        "the query round trip with no search (default: hnsw)")
     p.add_argument("--k", type=int, default=10, help="neighbors per query (default: 10)")
     p.add_argument("--sweep", help="comma-separated ef_search (hnsw), probes (ivfflat) or "
                    f"nprobe (prism) values (default: hnsw {DEFAULT_SWEEP['hnsw']}; "
@@ -192,8 +218,17 @@ def parse_args() -> argparse.Namespace:
         EXTRA_SETTINGS[name.strip()] = value.strip()
     if args.rabitq_bits and args.index != "hnsw":
         p.error("--rabitq-bits only applies to --index hnsw")
-    if args.index == "none" and args.sweep != "0":
-        p.error("--sweep has no effect with --index none")
+    if args.index in ("none", "rtt") and args.sweep != "0":
+        p.error(f"--sweep has no effect with --index {args.index}")
+    if args.index in INDEX_AMS:
+        # When the vectors are TOASTed (anything over ~2 KB, e.g. 1536-d
+        # float4), the heap is a few hundred pages of pointers and the planner
+        # prices a seq scan + sort as nearly free: it does not cost detoasting
+        # 6 KB per row. Measured: at prism.nprobe=80 on 100K x 1536 it chose a
+        # seq scan costed at 4051. Disabling seq scans for index arms keeps the
+        # benchmark on the index it means to measure; check_plan still proves
+        # it at every point, and the setting is recorded in the results.
+        EXTRA_SETTINGS.setdefault("enable_seqscan", "off")
     return args
 
 
@@ -357,6 +392,93 @@ def check_plan(conn, ds, args, index_name, query_vec, guc=None, value=None) -> N
         sys.exit(f"error: expected an exact sequential scan:\n{plan}")
 
 
+# --- memory guard ------------------------------------------------------------
+#
+# Every measurement here is meant to be fully in memory. prewarm_or_die checks
+# that once, before a phase; these checks hold it for every sweep point, after
+# its timing window, so a point that ran partly from disk fails instead of
+# becoming a plausible-looking slow number.
+
+VMSTAT_KEYS = ("pswpin", "pswpout", "pgmajfault")
+
+
+def vmstat() -> dict | None:
+    """The swap and major-fault counters from /proc/vmstat (None off Linux)."""
+    try:
+        with open("/proc/vmstat") as f:
+            pairs = (line.split() for line in f)
+            return {k: int(v) for k, v in pairs if k in VMSTAT_KEYS}
+    except FileNotFoundError:
+        return None
+
+
+def require_no_swap() -> None:
+    try:
+        with open("/proc/swaps") as f:
+            active = f.read().splitlines()[1:]
+    except FileNotFoundError:
+        return
+    if active:
+        sys.exit("error: swap is enabled, so a run that does not fit in RAM would slow down "
+                 "silently instead of failing. Run `sudo swapoff -a` (bench/cloudlab/setup_node.sh "
+                 "does) or unset REQUIRE_NO_SWAP.\n" + "\n".join(active))
+
+
+def memory_check(args, ds, before: dict | None) -> dict:
+    """Fail the run if the sweep point swapped or its relations left shared_buffers."""
+    out: dict = {}
+    after = vmstat()
+    if before is not None and after is not None:
+        out = {k: after[k] - before[k] for k in VMSTAT_KEYS}
+        if out["pswpin"] or out["pswpout"]:
+            sys.exit(f"error: the machine swapped during this sweep point ({out}); the data does "
+                     f"not fit in memory alongside everything else running")
+    if args.index != "rtt":
+        with connect(args.dsn) as conn:
+            res = residency(conn, ds.table)
+        if res is not None:
+            blocks, cached = res
+            out["blocks"], out["cached"] = blocks, cached
+            # --no-save points are the build phases' sanity queries, run on a
+            # deliberately small build-time buffer pool; nothing they measure
+            # is kept. Every saved point must have run fully resident.
+            if cached < blocks and not args.no_save:
+                sys.exit(f"error: {blocks - cached} of {blocks} blocks of {ds.table} and its indexes "
+                         f"left shared_buffers during the sweep point; raise shared_buffers")
+    return out
+
+
+def residency(conn, table: str) -> tuple[int, int] | None:
+    """(blocks, blocks in shared_buffers) over the table, its TOAST table and
+    all their indexes, or None without pg_buffercache. Same relation set as
+    run_experiment.sh's prewarm_or_die.
+
+    TOAST matters here: a 1536-d vector is ~6 KB, past the ~2 KB TOAST
+    threshold, so the heap holds only a pointer and the vectors themselves live
+    in the TOAST relation -- which anything that reads vectors from the table
+    (PRISM's rerank, an exact scan) depends on."""
+    if not conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_buffercache'").fetchone():
+        return None
+    row = conn.execute(
+        """SELECT coalesce(sum(blocks), 0)::bigint, coalesce(sum(cached), 0)::bigint FROM (
+             SELECT pg_relation_size(c.oid) / current_setting('block_size')::int AS blocks,
+                    (SELECT count(*) FROM pg_buffercache b
+                      WHERE b.relfilenode = pg_relation_filenode(c.oid)
+                        AND b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+                        AND b.relforknumber = 0) AS cached
+             FROM pg_class c
+             WHERE c.oid IN (
+                     SELECT %(t)s::regclass::oid
+                     UNION ALL SELECT reltoastrelid FROM pg_class
+                               WHERE oid = %(t)s::regclass AND reltoastrelid <> 0
+                     UNION ALL SELECT indexrelid FROM pg_index WHERE indrelid IN (
+                       %(t)s::regclass,
+                       (SELECT reltoastrelid FROM pg_class WHERE oid = %(t)s::regclass)))
+               AND pg_relation_size(c.oid) > 0) s""",
+        {"t": table}).fetchone()
+    return int(row[0]), int(row[1])
+
+
 # --- queries -----------------------------------------------------------------
 
 
@@ -374,7 +496,10 @@ def run_queries(dsn, ds, test, k, guc, value, clients, duration=0.0, index="hnsw
     wall time in ns from the first query start to the last query end, and the
     total number of queries executed).
     """
-    query = f"SELECT id FROM {ident(ds.table)} ORDER BY {order_by(ds, index)} LIMIT {k}"
+    if index == "rtt":
+        query = RTT_QUERY
+    else:
+        query = f"SELECT id FROM {ident(ds.table)} ORDER BY {order_by(ds, index)} LIMIT {k}"
     slices = np.array_split(np.arange(len(test)), clients)
     jobs = [(dsn, query, guc, value, k, test[s], duration) for s in slices]
 
@@ -463,7 +588,8 @@ def print_header(guc) -> None:
 def print_row(r) -> None:
     lat = r["latency_ms"]
     value = r["search_value"] if r["search_value"] is not None else "-"
-    print(f"{value:>16} {r['recall']:>8.4f} {r['qps']:>10.1f} {lat['p50']:>9.3f} {lat['p95']:>9.3f} {lat['p99']:>9.3f}",
+    recall = f"{r['recall']:>8.4f}" if r["recall"] is not None else f"{'-':>8}"
+    print(f"{value:>16} {recall} {r['qps']:>10.1f} {lat['p50']:>9.3f} {lat['p95']:>9.3f} {lat['p99']:>9.3f}",
           flush=True)
 
 
@@ -500,6 +626,11 @@ def pgvector_git_rev() -> str | None:
         return rev + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
     except (OSError, subprocess.CalledProcessError):
         return None
+
+
+def server_is_local(host: str | None) -> bool:
+    """True for a Unix socket or a loopback address: the client shares the server's machine."""
+    return not host or host.startswith("/") or host in ("localhost", "127.0.0.1", "::1")
 
 
 def vector_so_digest() -> str | None:

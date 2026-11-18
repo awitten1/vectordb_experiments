@@ -1,5 +1,8 @@
 # HNSW on pgvector: where the time goes, and what moves it
 
+> The four-way comparison with Ginger, pgvectorfast and PRISM on DBpedia-OpenAI
+> 1M (CloudLab m510) is in `bench/FINDINGS-dbpedia.md`.
+
 Working notes from the 2026-11-02/04 session on an 18M-vector BIGANN index.
 `bench/REPORT.md` is the SIFT-1M report that predates this; the numbers here
 supersede it. Everything below is measured on this machine unless flagged as an

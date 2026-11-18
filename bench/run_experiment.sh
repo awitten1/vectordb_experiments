@@ -4,6 +4,8 @@
 #
 # Usage: bench/run_experiment.sh [phase ...]          (no phase = all of them)
 #   phases: data build query concurrency profile build_prism compare ivfflat exact rabitq
+#           pgvectorfast pvf_ablation prism_solo overhead
+#   For the DBpedia-OpenAI comparison on CloudLab, source bench/cloudlab/dbpedia.env first.
 #
 # NOTE ON ORDER: ann_bench.py keeps at most one vector index per table unless
 # --keep-other-indexes is passed. The ivfflat phase builds on its own copy of
@@ -75,6 +77,17 @@ LOG_DIR="${LOG_DIR:-$BENCH/results}"
 PSQL=("$BIN/psql" -h localhost -p "$PGPORT" -U postgres -d postgres -X -q)
 say() { printf '\n=== %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+# Postgres size setting (e.g. 28GB, 512MB) -> whole GB, rounded up.
+to_gb() {
+  local v="${1^^}"
+  case "$v" in
+    *TB) echo $(( ${v%TB} * 1024 )) ;;
+    *GB) echo "${v%GB}" ;;
+    *MB) echo $(( (${v%MB} + 1023) / 1024 )) ;;
+    *KB) echo 1 ;;
+    *) die "cannot parse size '$1'" ;;
+  esac
+}
 
 # ---- server control ---------------------------------------------------------
 
@@ -160,6 +173,15 @@ start_server() {
   local want="shared_buffers=$sb maintenance_work_mem=$mwm $*"
   local stamp="$PGDATA_DIR/.bench_server_opts"
 
+  # shared_buffers plus maintenance_work_mem (the build's DSM arena) must fit
+  # in RAM with room for backends, the client and the OS; otherwise "in
+  # memory" is a promise the kernel cannot keep.
+  local need_gb total_gb
+  need_gb=$(( $(to_gb "$sb") + $(to_gb "$mwm") + 6 ))
+  total_gb=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
+  [ "$need_gb" -le "$total_gb" ] ||
+    die "shared_buffers=$sb + maintenance_work_mem=$mwm + 6 GB headroom = ${need_gb} GB > ${total_gb} GB RAM"
+
   if "$BIN/pg_ctl" -D "$PGDATA_DIR" status >/dev/null 2>&1 &&
      [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ]; then
     echo "reusing the running server (config unchanged: $want)" >&2
@@ -211,7 +233,7 @@ index_args() {
 # index (ef_search=10 went from 8 QPS to 945 QPS here on that alone).
 prewarm_or_die() {
   local t="${1:-$(dataset_table)}"
-  say "prewarming $t + its indexes into shared_buffers"
+  say "prewarming $t + its TOAST table + all their indexes into shared_buffers"
 
   # Prewarming an already-resident pool re-reads every block for nothing, so
   # check first. The residency assert below still runs either way.
@@ -222,8 +244,12 @@ LEFT JOIN pg_buffercache b
   ON b.relfilenode = pg_relation_filenode(c.oid)
  AND b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
  AND b.relforknumber = 0
-WHERE (c.relname = :'t' OR i.indrelid = :'t'::regclass)
-  AND c.relkind IN ('r','i') AND pg_relation_size(c.oid) > 0
+WHERE c.oid IN (
+        SELECT :'t'::regclass::oid
+        UNION ALL SELECT reltoastrelid FROM pg_class WHERE oid = :'t'::regclass AND reltoastrelid <> 0
+        UNION ALL SELECT indexrelid FROM pg_index WHERE indrelid IN (
+          :'t'::regclass, (SELECT reltoastrelid FROM pg_class WHERE oid = :'t'::regclass)))
+  AND pg_relation_size(c.oid) > 0
 GROUP BY c.oid
 HAVING count(b.bufferid) <> pg_relation_size(c.oid) / current_setting('block_size')::int;
 SQL
@@ -233,14 +259,21 @@ SQL
   "${PSQL[@]}" -v t="$t" >/dev/null <<'SQL'
 SELECT pg_prewarm(c.oid) FROM pg_class c
 LEFT JOIN pg_index i ON i.indexrelid = c.oid
-WHERE (c.relname = :'t' OR i.indrelid = :'t'::regclass)
-  AND c.relkind IN ('r', 'i') AND pg_relation_size(c.oid) > 0;
+WHERE c.oid IN (
+        SELECT :'t'::regclass::oid
+        UNION ALL SELECT reltoastrelid FROM pg_class WHERE oid = :'t'::regclass AND reltoastrelid <> 0
+        UNION ALL SELECT indexrelid FROM pg_index WHERE indrelid IN (
+          :'t'::regclass, (SELECT reltoastrelid FROM pg_class WHERE oid = :'t'::regclass)))
+  AND pg_relation_size(c.oid) > 0;
 SQL
   fi
 
-  "${PSQL[@]}" -v t="$t" -At -F $'\t' <<'SQL' | tee /dev/stderr | awk -F '\t' '
-      $2 != $3 { bad = 1 }
-      END { if (bad) { print "error: not all blocks are resident; raise QUERY_SB" > "/dev/stderr"; exit 1 } }'
+  # Captured, then printed, rather than piped through `tee /dev/stderr`: when
+  # stderr is redirected to a file (nohup ... > run.log 2>&1), tee reopens
+  # /dev/stderr with O_TRUNC and wipes the run log -- which is how the HNSW
+  # build-time lines of the first DBpedia runs were lost.
+  local residency
+  residency="$("${PSQL[@]}" -v t="$t" -At -F $'\t' <<'SQL'
 SELECT c.relname,
        pg_relation_size(c.oid) / current_setting('block_size')::int AS blocks,
        count(b.bufferid) AS cached
@@ -250,11 +283,19 @@ LEFT JOIN pg_buffercache b
   ON b.relfilenode = pg_relation_filenode(c.oid)
  AND b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
  AND b.relforknumber = 0
-WHERE (c.relname = :'t' OR i.indrelid = :'t'::regclass)
-  AND c.relkind IN ('r', 'i') AND pg_relation_size(c.oid) > 0
+WHERE c.oid IN (
+        SELECT :'t'::regclass::oid
+        UNION ALL SELECT reltoastrelid FROM pg_class WHERE oid = :'t'::regclass AND reltoastrelid <> 0
+        UNION ALL SELECT indexrelid FROM pg_index WHERE indrelid IN (
+          :'t'::regclass, (SELECT reltoastrelid FROM pg_class WHERE oid = :'t'::regclass)))
+  AND pg_relation_size(c.oid) > 0
 GROUP BY c.oid, c.relname
 ORDER BY c.relname;
 SQL
+)"
+  printf '%s\n' "$residency" >&2
+  awk -F '\t' '$2 != $3 { bad = 1 } END { exit bad }' <<<"$residency" ||
+    die "not all blocks are resident; raise QUERY_SB"
 }
 
 report_sizes() {
@@ -263,8 +304,12 @@ SELECT c.relname, pg_size_pretty(pg_relation_size(c.oid)) AS size,
        pg_relation_size(c.oid) / current_setting('block_size')::int AS blocks
 FROM pg_class c
 LEFT JOIN pg_index i ON i.indexrelid = c.oid
-WHERE (c.relname = :'t' OR i.indrelid = :'t'::regclass)
-  AND c.relkind IN ('r','i') AND pg_relation_size(c.oid) > 0
+WHERE c.oid IN (
+        SELECT :'t'::regclass::oid
+        UNION ALL SELECT reltoastrelid FROM pg_class WHERE oid = :'t'::regclass AND reltoastrelid <> 0
+        UNION ALL SELECT indexrelid FROM pg_index WHERE indrelid IN (
+          :'t'::regclass, (SELECT reltoastrelid FROM pg_class WHERE oid = :'t'::regclass)))
+  AND pg_relation_size(c.oid) > 0
 ORDER BY 1;
 SQL
 }
@@ -502,48 +547,91 @@ phase_rabitq() {
 # Calico has to be in shared_preload_libraries, so every arm restarts the
 # server -- stock arms too, so both pay the same cold-start cost. Arms repeat
 # (PVF_ARMS="stock fast stock fast") so that restart-to-restart noise shows up
-# as disagreement between rounds instead of passing for a difference.
-#
-# The database's vector functions are bound to $libdir/vector, not
-# $libdir/vectorfast, so the fast arm points vector.so at vectorfast.so with a
-# symlink. dfmgr matches libraries by inode, so the backend maps only
-# vectorfast.so, once. Requires a non-LTO Postgres (Calico refuses LTO builds).
+# as disagreement between rounds instead of passing for a difference. Each arm
+# is set up by serve_arm, below.
 PVF_ARMS="${PVF_ARMS:-stock fast stock fast}"
 PVF_EF_SWEEP="${PVF_EF_SWEEP:-10,20,40,80,160,320,640,1000}"
 PVF_CLIENTS="${PVF_CLIENTS:-1,8}"
 STOCK_SO="${STOCK_SO:-}"                 # a stock pgvector vector.so (e.g. v0.8.7)
 FAST_SO="${FAST_SO:-$ROOT/pgvectorfast/vectorfast.so}"
 
+# Bring the query server up as one pgvector arm (stock | fast) on the shared
+# HNSW index, prewarmed. Extra arguments are passed to start_server, e.g. a
+# listen_addresses for a client on another machine. Every arm restarts the
+# server, stock arms too, so both pay the same cold-start cost.
+#
+# The database's vector functions are bound to $libdir/vector, not
+# $libdir/vectorfast, so the fast arm points vector.so at vectorfast.so with a
+# symlink. dfmgr matches libraries by inode, so the backend maps only
+# vectorfast.so, once. Requires a non-LTO Postgres (Calico refuses LTO builds).
+serve_arm() {
+  local arm="$1"; shift
+  local lib preload=""
+  lib="$("$BIN/pg_config" --pkglibdir)"
+  stop_server
+  rm -f "$lib/vector.so"
+  case "$arm" in
+    stock) install -m755 "$STOCK_SO" "$lib/vector.so" ;;
+    fast)  install -m755 "$FAST_SO" "$lib/vectorfast.so"
+           ln -s vectorfast.so "$lib/vector.so"
+           preload="-c shared_preload_libraries=vectorfast" ;;
+    *) die "unknown arm '$arm' (want stock or fast)" ;;
+  esac
+  # shellcheck disable=SC2086  # preload is split on purpose
+  start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0 $preload "$@"
+  if [ "$arm" = fast ]; then
+    "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS calico" -c "CALL calico.activate()" >/dev/null
+    [ "$("${PSQL[@]}" -At -c 'SELECT calico.status()')" = calico ] ||
+      die "calico did not activate"
+  fi
+  prewarm_or_die
+}
+
+# Leave the server up as one arm (SERVE_ARM=stock|fast), reachable from a
+# client on another machine at LISTEN_IP from CLIENT_NET. The client is then
+# driven separately (bench/cloudlab/remote_client.sh); KEEP_RUNNING is forced.
+#
+# Trust auth on a private experiment network only: CLIENT_NET must be the
+# CloudLab LAN, never a routable range.
+LISTEN_IP="${LISTEN_IP:-}"
+CLIENT_NET="${CLIENT_NET:-}"
+phase_serve() {
+  [ -n "$LISTEN_IP" ] && [ -n "$CLIENT_NET" ] || die "set LISTEN_IP and CLIENT_NET for serve"
+  case "$CLIENT_NET" in
+    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;;
+    *) die "CLIENT_NET=$CLIENT_NET is not a private range; refusing trust auth" ;;
+  esac
+  local hba="$PGDATA_DIR/pg_hba.conf" line="host all postgres $CLIENT_NET trust"
+  grep -qxF "$line" "$hba" || printf '%s\n' "$line" >> "$hba"
+  serve_arm "${SERVE_ARM:?set SERVE_ARM=stock or fast}" -c "listen_addresses=localhost,$LISTEN_IP"
+  "${PSQL[@]}" -c "SELECT pg_reload_conf()" >/dev/null
+  # SERVE_TABLE (e.g. the PRISM copy) replaces the main table in the buffer pool.
+  if [ -n "${SERVE_TABLE:-}" ]; then
+    "${PSQL[@]}" -c "SELECT pg_buffercache_evict_all()" >/dev/null
+    prewarm_or_die "$SERVE_TABLE"
+  fi
+  KEEP_RUNNING=1
+  say "serving the $SERVE_ARM arm on $LISTEN_IP:$PGPORT for clients in $CLIENT_NET"
+}
+
 phase_pgvectorfast() {
   [ -f "$STOCK_SO" ] || die "set STOCK_SO to a stock pgvector vector.so"
-  [ -f "$FAST_SO" ] || die "no $FAST_SO; build pgvectorfast first"
   local lib; lib="$("$BIN/pg_config" --pkglibdir)"
-  [ -f "$("$BIN/pg_config" --sharedir)/extension/calico.control" ] ||
-    die "calico extension files not installed"
-  # grep -c, not -q: -q exits early and pipefail then sees nm's SIGPIPE.
-  [ "$(nm "$FAST_SO" | grep -c ' calico_')" -gt 0 ] || die "$FAST_SO has no calico symbols"
+  # A stock-only run (PVF_ARMS="stock stock", e.g. a cross-node baseline) does
+  # not need pgvectorfast built at all.
+  if [[ " $PVF_ARMS " == *" fast "* ]]; then
+    [ -f "$FAST_SO" ] || die "no $FAST_SO; build pgvectorfast first"
+    [ -f "$("$BIN/pg_config" --sharedir)/extension/calico.control" ] ||
+      die "calico extension files not installed"
+    # grep -c, not -q: -q exits early and pipefail then sees nm's SIGPIPE.
+    [ "$(nm "$FAST_SO" | grep -c ' calico_')" -gt 0 ] || die "$FAST_SO has no calico symbols"
+  fi
   [ "$(nm "$STOCK_SO" | grep -c ' calico_' || true)" -eq 0 ] || die "$STOCK_SO has calico symbols"
 
-  local arm round=0 c preload
+  local arm round=0 c
   for arm in $PVF_ARMS; do
     round=$(( round + 1 ))
-    stop_server
-    rm -f "$lib/vector.so"
-    case "$arm" in
-      stock) install -m755 "$STOCK_SO" "$lib/vector.so"; preload="" ;;
-      fast)  install -m755 "$FAST_SO" "$lib/vectorfast.so"
-             ln -s vectorfast.so "$lib/vector.so"
-             preload="-c shared_preload_libraries=vectorfast" ;;
-      *) die "unknown arm '$arm' (want stock or fast)" ;;
-    esac
-    # shellcheck disable=SC2086  # preload is split on purpose
-    start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0 $preload
-    if [ "$arm" = fast ]; then
-      "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS calico" -c "CALL calico.activate()" >/dev/null
-      [ "$("${PSQL[@]}" -At -c 'SELECT calico.status()')" = calico ] ||
-        die "calico did not activate"
-    fi
-    prewarm_or_die
+    serve_arm "$arm"
     for c in ${PVF_CLIENTS//,/ }; do
       say "arm $round ($arm): HNSW ef_search sweep ($PVF_EF_SWEEP), $c client(s), ${DURATION}s per point"
       BENCH_LABEL="pvf-$arm-r$round" \
@@ -651,11 +739,89 @@ phase_pvf_ablation() {
   done
 }
 
+# Install STOCK_SO as the server's vector.so, replacing a pgvectorfast symlink
+# if one is there. A preload of vectorfast cannot be undone without a restart,
+# so the server is stopped first whenever the library actually changes.
+install_stock_so() {
+  [ -f "$STOCK_SO" ] || die "set STOCK_SO to a stock pgvector vector.so"
+  [ "$(nm "$STOCK_SO" | grep -c ' calico_' || true)" -eq 0 ] || die "$STOCK_SO has calico symbols"
+  local lib; lib="$("$BIN/pg_config" --pkglibdir)"
+  if [ -L "$lib/vector.so" ] || ! cmp -s "$STOCK_SO" "$lib/vector.so"; then
+    stop_server
+    rm -f "$lib/vector.so"
+    install -m755 "$STOCK_SO" "$lib/vector.so"
+  fi
+  [ "$(nm -D "$lib/vector.so" | grep -c calico_ || true)" -eq 0 ] ||
+    die "$lib/vector.so still has calico symbols"
+}
+
+# PRISM on its own server-side copy of the table, with stock pgvector loaded.
+#
+# A separate table means there is never a second ANN index for the planner to
+# switch to, and building or dropping indexes here cannot touch the HNSW index
+# the pgvector/pgvectorfast arms share. Stock vector.so, so no Calico and no
+# pgvectorfast code is anywhere in this arm's process.
+phase_prism_solo() {
+  local src t c
+  src="$(dataset_table)"
+  t="${src}_prism"
+  install_stock_so
+
+  start_server "$BUILD_SB" "$BUILD_MWM"
+  "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS pg_vectorsearch" >/dev/null
+  if [ "$("${PSQL[@]}" -At -c "SELECT count(*) FROM $t" 2>/dev/null || echo 0)" != \
+       "$("${PSQL[@]}" -At -c "SELECT count(*) FROM $src")" ]; then
+    say "copying $src -> $t (server-side)"
+    "${PSQL[@]}" -c "DROP TABLE IF EXISTS $t" >/dev/null
+    "${PSQL[@]}" -c "CREATE TABLE $t AS SELECT * FROM $src" >/dev/null
+    "${PSQL[@]}" -c "ANALYZE $t" >/dev/null
+  fi
+  say "building PRISM on $t (auto nlist, $WORKERS workers)"
+  bench --index prism --table "$t" --sweep 20 --num-queries 100 --no-save \
+        --maintenance-work-mem "$BUILD_MWM" --parallel-workers "$WORKERS" \
+        ${REBUILD:+--rebuild}
+  report_sizes "$t"
+
+  start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0
+  "${PSQL[@]}" -c "SELECT pg_buffercache_evict_all()" >/dev/null
+  prewarm_or_die "$t"
+  for c in ${CLIENTS//,/ }; do
+    say "PRISM nprobe sweep ($NPROBE_SWEEP) on $t, $c client(s), ${DURATION}s per point"
+    BENCH_LABEL="prism-solo" \
+      bench --index prism --table "$t" --sweep "$NPROBE_SWEEP" --clients "$c" \
+            --num-queries "$NUM_QUERIES" --duration "$DURATION"
+  done
+}
+
+# The floor every Postgres query pays before any index work: the same client,
+# prepared statement and vector parameter as an ANN query, with no search (see
+# RTT_QUERY in ann_bench.py). In-process engines (Ginger, FAISS) never pay it,
+# so it is what to subtract when reading them against Postgres on one chart.
+phase_overhead() {
+  local c
+  install_stock_so
+  start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0
+  for c in ${CLIENTS//,/ }; do
+    say "round-trip floor, $c client(s), ${DURATION}s"
+    BENCH_LABEL="rtt" \
+      bench --index rtt --clients "$c" --num-queries "$NUM_QUERIES" --duration "$DURATION"
+  done
+}
+
 # ---- main -------------------------------------------------------------------
 
 [ -x "$PY" ] || die "no venv at $PY; create it with: python3 -m venv bench/.venv && bench/.venv/bin/pip install -r bench/requirements.txt"
 [ -x "$BIN/pg_ctl" ] || die "Postgres not built; run ./build_postgres.sh first"
 mkdir -p "$LOG_DIR"
+
+# Environment guards, opted into by bench/cloudlab/dbpedia.env. Both reset on a
+# reboot, so they are checked on every run rather than trusted from setup.
+if [ "${REQUIRE_PINNED:-0}" = 1 ]; then
+  "$BENCH/cloudlab/pin_cpu.sh" check || die "CPU clock not pinned"
+fi
+if [ "${REQUIRE_NO_SWAP:-0}" = 1 ] && [ -n "$(tail -n +2 /proc/swaps)" ]; then
+  die "swap is enabled; run 'sudo swapoff -a' so a run that does not fit in RAM fails instead of slowing down"
+fi
 
 PHASES=("$@")
 [ ${#PHASES[@]} -eq 0 ] && PHASES=(data build query concurrency profile ivfflat exact)
@@ -669,8 +835,8 @@ printf 'phases: %s\n' "${PHASES[*]}" >&2
 START=$SECONDS
 for p in "${PHASES[@]}"; do
   case "$p" in
-    data|build|query|concurrency|ivfflat|exact|profile|compare|build_prism|rabitq|pgvectorfast|pvf_ablation) "phase_$p" ;;
-    *) die "unknown phase '$p' (want: data build query concurrency profile build_prism compare ivfflat exact rabitq pgvectorfast pvf_ablation)" ;;
+    data|build|query|concurrency|ivfflat|exact|profile|compare|build_prism|rabitq|pgvectorfast|pvf_ablation|prism_solo|overhead|serve) "phase_$p" ;;
+    *) die "unknown phase '$p' (want: data build query concurrency profile build_prism compare ivfflat exact rabitq pgvectorfast pvf_ablation prism_solo overhead serve)" ;;
   esac
 done
 

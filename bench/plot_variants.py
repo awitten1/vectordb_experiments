@@ -81,6 +81,50 @@ SERIES = [
      and not r.get("label") and not (r.get("build_params") or {}).get("rabitq_bits")},
 ]
 
+BIGANN_NOTE = ("Measured: PRISM, IVFFlat 2026-11-05 · RaBitQ, rabitq-branch plain HNSW 2026-11-13 · "
+               "pgvector 0.8.7 vs pgvectorfast back-to-back 2026-11-16, rounds averaged.")
+
+# The CloudLab four-way comparison. Rows come from two nodes (see load()); the
+# stock-pgvector rows measured on the baseline host are drawn as a dashed line
+# in pgvector's own hue, so node-to-node agreement reads as two overlapping
+# lines. Ginger runs in-process: its curve does not pay the Postgres round
+# trip that the `rtt` rows of the overhead phase measure.
+BASELINE_HOST = "node-1"
+
+
+def on_baseline(r) -> bool:
+    return (r.get("host") or r.get("_node") or "").startswith(BASELINE_HOST)
+
+
+def ginger(cfg):
+    # ginger_bench writes the config *name* into the label (ginger-<cfg>) and
+    # the resolved GingerSearcherConfig proto text into `ginger_config`.
+    return lambda r: r.get("engine") == "ginger" and r.get("label") == f"ginger-{cfg}"
+
+
+DBPEDIA_SERIES = [
+    {"name": "pgvector 0.8.7 HNSW", "short": "pgvector 0.8.7", "index": "hnsw", "agg": "mean",
+     "slot": 1, "match": lambda r: is_label("pvf-stock")(r) and not on_baseline(r)},
+    {"name": "PRISM (pg_vectorsearch)", "short": "PRISM", "index": "prism", "agg": "mean",
+     "slot": 2, "match": is_label("prism-solo")},
+    {"name": "Ginger (PCA, 4+8-bit TQ)", "short": "Ginger", "index": None,
+     "agg": "mean", "slot": 3, "match": ginger("recommended")},
+    {"name": "pgvectorfast HNSW", "short": "pgvectorfast", "index": "hnsw", "agg": "mean",
+     "slot": 4, "match": lambda r: is_label("pvf-fast")(r) and not on_baseline(r)},
+    {"name": "Ginger, float rerank", "short": "Ginger float-rerank", "index": None,
+     "agg": "mean", "slot": 3, "dash": True, "match": ginger("float-rerank")},
+    # node-1's stock pgvector rerun is left off: it only checks that the two
+    # nodes are interchangeable (they agree within 1-5% at matched recall; see
+    # FINDINGS-dbpedia.md), so it would plot the same curve twice.
+]
+DBPEDIA_NOTE = ("m510, Xeon D-1548 @ 2.0 GHz pinned, AVX2. Ginger in-process; Postgres adds a 0.31 ms "
+                "round trip and reads a 7.4 GiB TOAST table not in its size. Rounds averaged.")
+
+BIGANN_TITLE = "18M BIGANN (SIFT), {n} index variants"
+DBPEDIA_TITLE = "DBpedia OpenAI 1M (ada-002, 1536-d), {n} variants"
+SERIES_SETS = {"bigann": (SERIES, BIGANN_NOTE, BIGANN_TITLE),
+               "dbpedia": (DBPEDIA_SERIES, DBPEDIA_NOTE, DBPEDIA_TITLE)}
+
 W, H = 1000, 660
 PAD = {"l": 78, "r": 200, "t": 128, "b": 106}
 
@@ -93,17 +137,25 @@ def nines(recall: float) -> float:
     return -math.log10(1 - min(recall, 0.99999))
 
 
-def load(dataset: str, clients: int):
-    path = RESULTS_DIR / f"{dataset}.jsonl"
-    if not path.exists():
-        sys.exit(f"no results at {path}")
-    rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+def load(dataset: str, clients: int, series_spec=SERIES):
+    """Rows from bench/results/<dataset>.jsonl and from every per-node copy
+    under bench/results/<node>/ (what bench/cloudlab/sync.sh pull creates).
+    Each row is tagged with `_node`, the directory it came from."""
+    paths = [RESULTS_DIR / f"{dataset}.jsonl", *sorted(RESULTS_DIR.glob(f"*/{dataset}.jsonl"))]
+    paths = [p for p in paths if p.exists()]
+    if not paths:
+        sys.exit(f"no results for {dataset} under {RESULTS_DIR}")
+    rows = []
+    for path in paths:
+        node = "local" if path.parent == RESULTS_DIR else path.parent.name
+        rows += [{**json.loads(l), "_node": node} for l in path.read_text().splitlines() if l.strip()]
     # Deadline-based runs only: one pass over the queries is too short to time.
     rows = [r for r in rows if r.get("queries_executed") and r.get("search_value") is not None
             and r.get("clients", 1) == clients]
     out, dropped = [], 0
-    for slot, spec in enumerate(SERIES, start=1):
-        hits = [r for r in rows if r.get("index") == spec["index"] and spec["match"](r)]
+    for pos, spec in enumerate(series_spec, start=1):
+        slot = spec.get("slot", pos)
+        hits = [r for r in rows if spec["index"] in (None, r.get("index")) and spec["match"](r)]
         if not hits:
             continue
         by_val = defaultdict(list)
@@ -156,7 +208,7 @@ def spread(ys, lo, hi, gap):
     return res
 
 
-def build_svg(series, dataset, clients, dropped):
+def build_svg(series, dataset, clients, dropped, note1=BIGANN_NOTE, title=BIGANN_TITLE):
     qpss = [p["qps"] for s in series for p in s["rows"]]
     x0, x1 = nines(MIN_RECALL), nines(MAX_RECALL)
     y0, y1 = min(qpss) / 1.4, max(qpss) * 1.4
@@ -202,8 +254,8 @@ def build_svg(series, dataset, clients, dropped):
     a('.dash{stroke-dasharray:7 4}')
     a("</style>")
     a(f'<rect class="bg" x="0" y="0" width="{W}" height="{H}"/>')
-    a(f'<text class="ttl" x="{PAD["l"]}" y="34">Recall vs throughput — 18M BIGANN (SIFT), '
-      f'{len(series)} index variants, {clients} client{"s" if clients > 1 else ""}</text>')
+    a(f'<text class="ttl" x="{PAD["l"]}" y="34">Recall vs throughput — '
+      f'{esc(title.format(n=len(series)))}, {clients} client{"s" if clients > 1 else ""}</text>')
     a(f'<text class="sub" x="{PAD["l"]}" y="55">{m["rows"]:,} × {m["dim"]}-d vectors · '
       f'indexes fully resident in shared_buffers · Postgres {esc(m.get("postgres_version"))} · '
       f'k={m.get("k")} · {m.get("duration_s") or 60:g}s per point · hover a point for its value</text>')
@@ -254,8 +306,6 @@ def build_svg(series, dataset, clients, dropped):
 
     sizes = " · ".join(f'{s["short"]} {(s["meta"].get("index_bytes") or 0) / 1024 ** 3:.1f}'
                        for s in series)
-    note1 = ("Measured: PRISM, IVFFlat 2026-11-05 · RaBitQ, rabitq-branch plain HNSW 2026-11-13 · "
-             "pgvector 0.8.7 vs pgvectorfast back-to-back 2026-11-16, rounds averaged.")
     note2 = f"{dropped} points under recall {MIN_RECALL} not shown." if dropped else ""
     for k, line in enumerate((f"Index size (GiB): {sizes}", note1, note2)):
         if line:
@@ -270,15 +320,19 @@ def main():
     ap.add_argument("dataset")
     ap.add_argument("-o", "--out")
     ap.add_argument("--clients", type=int, default=1)
+    ap.add_argument("--series", choices=sorted(SERIES_SETS),
+                    help="which variant set to draw (default: bigann for bigann_* datasets, "
+                         "dbpedia otherwise)")
     args = ap.parse_args()
-    series, dropped = load(args.dataset, args.clients)
+    spec, note, title = SERIES_SETS[args.series or ("bigann" if args.dataset.startswith("bigann") else "dbpedia")]
+    series, dropped = load(args.dataset, args.clients, spec)
     if not series:
         sys.exit(f"no sweeps for {args.dataset} with clients={args.clients}")
     out = Path(args.out) if args.out else (
         REPO_ROOT / "bench" / "report"
         / f"{args.dataset.replace('_', '-')}-variants-{args.clients}c-recall-qps.svg")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(build_svg(series, args.dataset, args.clients, dropped))
+    out.write_text(build_svg(series, args.dataset, args.clients, dropped, note, title))
     for s in series:
         r = s["rows"]
         print(f'{s["name"]:>38}: {len(r)} pts, recall {r[0]["recall"]:.4f}–{r[-1]["recall"]:.4f}, '

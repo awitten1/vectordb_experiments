@@ -5,3 +5,4 @@ __pycache__/
 profiles/
 .tools/
 faiss/build/
+ginger/build/
