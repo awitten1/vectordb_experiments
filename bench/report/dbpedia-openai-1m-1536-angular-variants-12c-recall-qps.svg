@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 660" width="1000" height="660" role="img" aria-labelledby="t d" font-family="Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+<title id="t">Recall vs throughput by index variant, dbpedia_openai_1m_1536_angular, 12 client(s)</title>
+<desc id="d">pgvector 0.8.7 HNSW: ef_search 10 recall 0.7614 4,468 QPS, ef_search 20 recall 0.8516 3,594 QPS, ef_search 40 recall 0.9131 2,776 QPS, ef_search 80 recall 0.9508 2,042 QPS, ef_search 160 recall 0.9699 1,269 QPS, ef_search 320 recall 0.9805 739 QPS, ef_search 640 recall 0.9892 415 QPS, ef_search 1000 recall 0.9928 281 QPS; PRISM (pg_vectorsearch): nprobe 5 recall 0.8402 2,813 QPS, nprobe 10 recall 0.9028 2,083 QPS, nprobe 20 recall 0.9427 1,389 QPS, nprobe 40 recall 0.9673 795 QPS, nprobe 80 recall 0.9842 421 QPS, nprobe 160 recall 0.9942 217 QPS, nprobe 320 recall 0.9980 109 QPS; Ginger (PCA, 4+8-bit TQ): beam_size 10 recall 0.7374 39,199 QPS, beam_size 20 recall 0.8865 29,072 QPS, beam_size 40 recall 0.9498 19,690 QPS, beam_size 80 recall 0.9767 12,764 QPS, beam_size 160 recall 0.9890 8,091 QPS, beam_size 320 recall 0.9943 4,804 QPS, beam_size 640 recall 0.9969 2,678 QPS, beam_size 1000 recall 0.9984 1,784 QPS; pgvectorfast HNSW: ef_search 10 recall 0.7614 6,482 QPS, ef_search 20 recall 0.8516 5,244 QPS, ef_search 40 recall 0.9131 3,923 QPS, ef_search 80 recall 0.9508 2,689 QPS, ef_search 160 recall 0.9699 1,709 QPS, ef_search 320 recall 0.9805 1,003 QPS, ef_search 640 recall 0.9892 574 QPS, ef_search 1000 recall 0.9928 399 QPS; Ginger, float rerank: beam_size 10 recall 0.7908 25,304 QPS, beam_size 20 recall 0.9014 17,307 QPS, beam_size 40 recall 0.9533 11,095 QPS, beam_size 80 recall 0.9798 6,691 QPS, beam_size 160 recall 0.9908 3,940 QPS, beam_size 320 recall 0.9954 2,238 QPS, beam_size 640 recall 0.9979 1,257 QPS, beam_size 1000 recall 0.9987 857 QPS</desc>
+<style>
+:root{--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s7:#6250d6;--s8:#e34948}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#0ca30c;--s7:#9085e9;--s8:#e66767}}
+:root[data-theme="dark"]{--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--axis:#383835;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#0ca30c;--s7:#9085e9;--s8:#e66767}
+.bg{fill:var(--surface)} .ttl{fill:var(--ink);font-size:19px;font-weight:600}.sub{fill:var(--ink2);font-size:12.5px} .foot{fill:var(--muted);font-size:11.5px}.axlbl{fill:var(--ink2);font-size:12.5px;font-weight:500}.tick{fill:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums}.grid{stroke:var(--grid);stroke-width:1} .axis{stroke:var(--axis);stroke-width:1}.lgnd{fill:var(--ink);font-size:12px;font-weight:500}.end{fill:var(--ink);font-size:12px;font-weight:600}.lead{stroke:var(--axis);stroke-width:1;fill:none}.dot:hover{r:7}
+.l1{fill:none;stroke:var(--s1);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.d1{fill:var(--s1);stroke:var(--surface);stroke-width:2}
+.l2{fill:none;stroke:var(--s2);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.d2{fill:var(--s2);stroke:var(--surface);stroke-width:2}
+.l3{fill:none;stroke:var(--s3);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.d3{fill:var(--s3);stroke:var(--surface);stroke-width:2}
+.l4{fill:none;stroke:var(--s4);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.d4{fill:var(--s4);stroke:var(--surface);stroke-width:2}
+.l5{fill:none;stroke:var(--s5);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.d5{fill:var(--s5);stroke:var(--surface);stroke-width:2}
+.l6{fill:none;stroke:var(--s6);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.d6{fill:var(--s6);stroke:var(--surface);stroke-width:2}
+.l7{fill:none;stroke:var(--s7);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.d7{fill:var(--s7);stroke:var(--surface);stroke-width:2}
+.l8{fill:none;stroke:var(--s8);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.d8{fill:var(--s8);stroke:var(--surface);stroke-width:2}
+.dash{stroke-dasharray:7 4}
+</style>
+<rect class="bg" x="0" y="0" width="1000" height="660"/>
+<text class="ttl" x="78" y="34">Recall vs throughput — DBpedia OpenAI 1M (ada-002, 1536-d), 5 variants, 12 clients</text>
+<text class="sub" x="78" y="55">975,000 × 1536-d vectors · indexes fully resident in shared_buffers · Postgres 18.6 · k=10 · 60s per point · hover a point for its value</text>
+<line class="l1" x1="78" y1="80" x2="102" y2="80"/>
+<circle class="d1" cx="90" cy="80" r="4.5"/>
+<text class="lgnd" x="110" y="84">pgvector 0.8.7 HNSW</text>
+<line class="l2" x1="293" y1="80" x2="317" y2="80"/>
+<circle class="d2" cx="305" cy="80" r="4.5"/>
+<text class="lgnd" x="325" y="84">PRISM (pg_vectorsearch)</text>
+<line class="l3" x1="508" y1="80" x2="532" y2="80"/>
+<circle class="d3" cx="520" cy="80" r="4.5"/>
+<text class="lgnd" x="540" y="84">Ginger (PCA, 4+8-bit TQ)</text>
+<line class="l4" x1="723" y1="80" x2="747" y2="80"/>
+<circle class="d4" cx="735" cy="80" r="4.5"/>
+<text class="lgnd" x="755" y="84">pgvectorfast HNSW</text>
+<line class="l3 dash" x1="78" y1="100" x2="102" y2="100"/>
+<circle class="d3" cx="90" cy="100" r="4.5"/>
+<text class="lgnd" x="110" y="104">Ginger, float rerank</text>
+<line class="grid" x1="78" y1="537.9" x2="800" y2="537.9"/>
+<text class="tick" x="68" y="541.9" text-anchor="end">100</text>
+<line class="grid" x1="78" y1="492.9" x2="800" y2="492.9"/>
+<text class="tick" x="68" y="496.9" text-anchor="end">200</text>
+<line class="grid" x1="78" y1="433.3" x2="800" y2="433.3"/>
+<text class="tick" x="68" y="437.3" text-anchor="end">500</text>
+<line class="grid" x1="78" y1="388.3" x2="800" y2="388.3"/>
+<text class="tick" x="68" y="392.3" text-anchor="end">1,000</text>
+<line class="grid" x1="78" y1="343.2" x2="800" y2="343.2"/>
+<text class="tick" x="68" y="347.2" text-anchor="end">2,000</text>
+<line class="grid" x1="78" y1="283.7" x2="800" y2="283.7"/>
+<text class="tick" x="68" y="287.7" text-anchor="end">5,000</text>
+<line class="grid" x1="78" y1="238.6" x2="800" y2="238.6"/>
+<text class="tick" x="68" y="242.6" text-anchor="end">10,000</text>
+<line class="grid" x1="78" y1="193.6" x2="800" y2="193.6"/>
+<text class="tick" x="68" y="197.6" text-anchor="end">20,000</text>
+<line class="grid" x1="78" y1="134.0" x2="800" y2="134.0"/>
+<text class="tick" x="68" y="138.0" text-anchor="end">50,000</text>
+<line class="grid" x1="78.0" y1="554" x2="78.0" y2="128"/>
+<text class="tick" x="78.0" y="574" text-anchor="middle">0.5</text>
+<line class="grid" x1="184.5" y1="554" x2="184.5" y2="128"/>
+<text class="tick" x="184.5" y="574" text-anchor="middle">0.8</text>
+<line class="grid" x1="265.0" y1="554" x2="265.0" y2="128"/>
+<text class="tick" x="265.0" y="574" text-anchor="middle">0.9</text>
+<line class="grid" x1="345.5" y1="554" x2="345.5" y2="128"/>
+<text class="tick" x="345.5" y="574" text-anchor="middle">0.95</text>
+<line class="grid" x1="452.0" y1="554" x2="452.0" y2="128"/>
+<text class="tick" x="452.0" y="574" text-anchor="middle">0.98</text>
+<line class="grid" x1="532.5" y1="554" x2="532.5" y2="128"/>
+<text class="tick" x="532.5" y="574" text-anchor="middle">0.99</text>
+<line class="grid" x1="613.0" y1="554" x2="613.0" y2="128"/>
+<text class="tick" x="613.0" y="574" text-anchor="middle">0.995</text>
+<line class="grid" x1="719.5" y1="554" x2="719.5" y2="128"/>
+<text class="tick" x="719.5" y="574" text-anchor="middle">0.998</text>
+<line class="grid" x1="800.0" y1="554" x2="800.0" y2="128"/>
+<text class="tick" x="800.0" y="574" text-anchor="middle">0.999</text>
+<line class="axis" x1="78" y1="554" x2="800" y2="554"/>
+<line class="axis" x1="78" y1="554" x2="78" y2="128"/>
+<text class="axlbl" x="439" y="598" text-anchor="middle">recall@10  (scale spaces 0.9, 0.99, 0.999 evenly)</text>
+<text class="axlbl" transform="translate(22,341) rotate(-90)" text-anchor="middle">queries per second  (log scale)</text>
+<polyline class="l1" points="164.0,291.0 219.1,305.1 281.3,321.9 347.4,341.9 404.5,372.8 454.9,407.9 523.5,445.5 570.7,470.7"/>
+<polyline class="l2" points="210.5,321.1 268.3,340.6 329.7,366.9 394.8,403.2 479.3,444.4 595.8,487.5 719.5,532.1"/>
+<polyline class="l3" points="152.8,149.9 250.3,169.3 345.0,194.6 434.2,222.8 521.4,252.4 597.8,286.3 668.6,324.3 745.4,350.7"/>
+<polyline class="l4" points="164.0,266.8 219.1,280.6 281.3,299.5 347.4,324.0 404.5,353.4 454.9,388.1 523.5,424.3 570.7,447.9"/>
+<polyline class="l3 dash" points="179.2,178.3 266.6,203.0 353.4,231.9 450.8,264.8 542.2,299.2 622.7,335.9 713.8,373.4 769.5,398.3"/>
+<circle class="dot d1" cx="164.0" cy="291.0" r="4.5"><title>pgvector 0.8.7 HNSW — ef_search 10: recall 0.7614, 4,468 QPS</title></circle>
+<circle class="dot d1" cx="219.1" cy="305.1" r="4.5"><title>pgvector 0.8.7 HNSW — ef_search 20: recall 0.8516, 3,594 QPS</title></circle>
+<circle class="dot d1" cx="281.3" cy="321.9" r="4.5"><title>pgvector 0.8.7 HNSW — ef_search 40: recall 0.9131, 2,776 QPS</title></circle>
+<circle class="dot d1" cx="347.4" cy="341.9" r="4.5"><title>pgvector 0.8.7 HNSW — ef_search 80: recall 0.9508, 2,042 QPS</title></circle>
+<circle class="dot d1" cx="404.5" cy="372.8" r="4.5"><title>pgvector 0.8.7 HNSW — ef_search 160: recall 0.9699, 1,269 QPS</title></circle>
+<circle class="dot d1" cx="454.9" cy="407.9" r="4.5"><title>pgvector 0.8.7 HNSW — ef_search 320: recall 0.9805, 739 QPS</title></circle>
+<circle class="dot d1" cx="523.5" cy="445.5" r="4.5"><title>pgvector 0.8.7 HNSW — ef_search 640: recall 0.9892, 415 QPS</title></circle>
+<circle class="dot d1" cx="570.7" cy="470.7" r="4.5"><title>pgvector 0.8.7 HNSW — ef_search 1000: recall 0.9928, 281 QPS</title></circle>
+<circle class="dot d2" cx="210.5" cy="321.1" r="4.5"><title>PRISM (pg_vectorsearch) — nprobe 5: recall 0.8402, 2,813 QPS</title></circle>
+<circle class="dot d2" cx="268.3" cy="340.6" r="4.5"><title>PRISM (pg_vectorsearch) — nprobe 10: recall 0.9028, 2,083 QPS</title></circle>
+<circle class="dot d2" cx="329.7" cy="366.9" r="4.5"><title>PRISM (pg_vectorsearch) — nprobe 20: recall 0.9427, 1,389 QPS</title></circle>
+<circle class="dot d2" cx="394.8" cy="403.2" r="4.5"><title>PRISM (pg_vectorsearch) — nprobe 40: recall 0.9673, 795 QPS</title></circle>
+<circle class="dot d2" cx="479.3" cy="444.4" r="4.5"><title>PRISM (pg_vectorsearch) — nprobe 80: recall 0.9842, 421 QPS</title></circle>
+<circle class="dot d2" cx="595.8" cy="487.5" r="4.5"><title>PRISM (pg_vectorsearch) — nprobe 160: recall 0.9942, 217 QPS</title></circle>
+<circle class="dot d2" cx="719.5" cy="532.1" r="4.5"><title>PRISM (pg_vectorsearch) — nprobe 320: recall 0.9980, 109 QPS</title></circle>
+<circle class="dot d3" cx="152.8" cy="149.9" r="4.5"><title>Ginger (PCA, 4+8-bit TQ) — beam_size 10: recall 0.7374, 39,199 QPS</title></circle>
+<circle class="dot d3" cx="250.3" cy="169.3" r="4.5"><title>Ginger (PCA, 4+8-bit TQ) — beam_size 20: recall 0.8865, 29,072 QPS</title></circle>
+<circle class="dot d3" cx="345.0" cy="194.6" r="4.5"><title>Ginger (PCA, 4+8-bit TQ) — beam_size 40: recall 0.9498, 19,690 QPS</title></circle>
+<circle class="dot d3" cx="434.2" cy="222.8" r="4.5"><title>Ginger (PCA, 4+8-bit TQ) — beam_size 80: recall 0.9767, 12,764 QPS</title></circle>
+<circle class="dot d3" cx="521.4" cy="252.4" r="4.5"><title>Ginger (PCA, 4+8-bit TQ) — beam_size 160: recall 0.9890, 8,091 QPS</title></circle>
+<circle class="dot d3" cx="597.8" cy="286.3" r="4.5"><title>Ginger (PCA, 4+8-bit TQ) — beam_size 320: recall 0.9943, 4,804 QPS</title></circle>
+<circle class="dot d3" cx="668.6" cy="324.3" r="4.5"><title>Ginger (PCA, 4+8-bit TQ) — beam_size 640: recall 0.9969, 2,678 QPS</title></circle>
+<circle class="dot d3" cx="745.4" cy="350.7" r="4.5"><title>Ginger (PCA, 4+8-bit TQ) — beam_size 1000: recall 0.9984, 1,784 QPS</title></circle>
+<circle class="dot d4" cx="164.0" cy="266.8" r="4.5"><title>pgvectorfast HNSW — ef_search 10: recall 0.7614, 6,482 QPS</title></circle>
+<circle class="dot d4" cx="219.1" cy="280.6" r="4.5"><title>pgvectorfast HNSW — ef_search 20: recall 0.8516, 5,244 QPS</title></circle>
+<circle class="dot d4" cx="281.3" cy="299.5" r="4.5"><title>pgvectorfast HNSW — ef_search 40: recall 0.9131, 3,923 QPS</title></circle>
+<circle class="dot d4" cx="347.4" cy="324.0" r="4.5"><title>pgvectorfast HNSW — ef_search 80: recall 0.9508, 2,689 QPS</title></circle>
+<circle class="dot d4" cx="404.5" cy="353.4" r="4.5"><title>pgvectorfast HNSW — ef_search 160: recall 0.9699, 1,709 QPS</title></circle>
+<circle class="dot d4" cx="454.9" cy="388.1" r="4.5"><title>pgvectorfast HNSW — ef_search 320: recall 0.9805, 1,003 QPS</title></circle>
+<circle class="dot d4" cx="523.5" cy="424.3" r="4.5"><title>pgvectorfast HNSW — ef_search 640: recall 0.9892, 574 QPS</title></circle>
+<circle class="dot d4" cx="570.7" cy="447.9" r="4.5"><title>pgvectorfast HNSW — ef_search 1000: recall 0.9928, 399 QPS</title></circle>
+<circle class="dot d3" cx="179.2" cy="178.3" r="4.5"><title>Ginger, float rerank — beam_size 10: recall 0.7908, 25,304 QPS</title></circle>
+<circle class="dot d3" cx="266.6" cy="203.0" r="4.5"><title>Ginger, float rerank — beam_size 20: recall 0.9014, 17,307 QPS</title></circle>
+<circle class="dot d3" cx="353.4" cy="231.9" r="4.5"><title>Ginger, float rerank — beam_size 40: recall 0.9533, 11,095 QPS</title></circle>
+<circle class="dot d3" cx="450.8" cy="264.8" r="4.5"><title>Ginger, float rerank — beam_size 80: recall 0.9798, 6,691 QPS</title></circle>
+<circle class="dot d3" cx="542.2" cy="299.2" r="4.5"><title>Ginger, float rerank — beam_size 160: recall 0.9908, 3,940 QPS</title></circle>
+<circle class="dot d3" cx="622.7" cy="335.9" r="4.5"><title>Ginger, float rerank — beam_size 320: recall 0.9954, 2,238 QPS</title></circle>
+<circle class="dot d3" cx="713.8" cy="373.4" r="4.5"><title>Ginger, float rerank — beam_size 640: recall 0.9979, 1,257 QPS</title></circle>
+<circle class="dot d3" cx="769.5" cy="398.3" r="4.5"><title>Ginger, float rerank — beam_size 1000: recall 0.9987, 857 QPS</title></circle>
+<polyline class="lead" points="576.7,470.7 810.0,466.7"/>
+<text class="end" x="814" y="470.7">pgvector 0.8.7</text>
+<polyline class="lead" points="725.5,532.1 810.0,528.1"/>
+<text class="end" x="814" y="532.1">PRISM</text>
+<polyline class="lead" points="751.4,350.7 810.0,346.7"/>
+<text class="end" x="814" y="350.7">Ginger</text>
+<polyline class="lead" points="576.7,447.9 810.0,443.9"/>
+<text class="end" x="814" y="447.9">pgvectorfast</text>
+<polyline class="lead" points="775.5,398.3 810.0,394.3"/>
+<text class="end" x="814" y="398.3">Ginger float-rerank</text>
+<text class="foot" x="78" y="620">Index size (GiB): pgvector 0.8.7 7.4 · PRISM 0.4 · Ginger 2.4 · pgvectorfast 7.4 · Ginger float-rerank 6.3</text>
+<text class="foot" x="78" y="636">m510, Xeon D-1548 @ 2.0 GHz pinned, AVX2. Ginger in-process. Postgres client local at 1 client, on a 2nd node over 10 GbE from 8 up. Rounds averaged.</text>
+</svg>

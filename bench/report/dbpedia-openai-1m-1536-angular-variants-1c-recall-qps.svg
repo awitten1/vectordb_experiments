@@ -129,5 +129,5 @@
 <polyline class="lead" points="775.5,397.3 810.0,393.3"/>
 <text class="end" x="814" y="397.3">Ginger float-rerank</text>
 <text class="foot" x="78" y="620">Index size (GiB): pgvector 0.8.7 7.4 · PRISM 0.4 · Ginger 2.4 · pgvectorfast 7.4 · Ginger float-rerank 6.3</text>
-<text class="foot" x="78" y="636">m510, Xeon D-1548 @ 2.0 GHz pinned, AVX2. Ginger in-process; Postgres adds a 0.31 ms round trip and reads a 7.4 GiB TOAST table not in its size. Rounds averaged.</text>
+<text class="foot" x="78" y="636">m510, Xeon D-1548 @ 2.0 GHz pinned, AVX2. Ginger in-process. Postgres client local at 1 client, on a 2nd node over 10 GbE from 8 up. Rounds averaged.</text>
 </svg>

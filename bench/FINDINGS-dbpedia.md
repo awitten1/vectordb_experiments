@@ -6,6 +6,12 @@ numbers in absolute terms.
 
 ![recall vs QPS, 1 client](report/dbpedia-openai-1m-1536-angular-variants-1c-recall-qps.svg)
 ![recall vs QPS, 8 clients](report/dbpedia-openai-1m-1536-angular-variants-8c-recall-qps.svg)
+![recall vs QPS, 12 clients](report/dbpedia-openai-1m-1536-angular-variants-12c-recall-qps.svg)
+![recall vs QPS, 16 clients](report/dbpedia-openai-1m-1536-angular-variants-16c-recall-qps.svg)
+
+From 8 clients up, the Postgres client runs on the second node, over the
+private 10 GbE network (see "Where the client runs"). At 1 client it shares the
+server's machine.
 
 ## Setup
 
@@ -42,7 +48,11 @@ numbers in absolute terms.
 
 - **Protocol:**
   - Each point runs for 60 s; k=10.
-  - 1 and 8 clients for Postgres; 1 and 8 query threads for Ginger.
+  - 1, 8, 12 and 16 clients for Postgres; the same numbers of query threads
+    for Ginger.
+  - At 1 client the Python client runs on node-0 beside the server. From 8 up
+    it runs on node-1 and connects over the private LAN, so it doesn't compete
+    with the backends for node-0's cores.
   - Postgres runs with `shared_buffers=28GB`, and the table, its TOAST table
     and all their indexes are prewarmed.
   - Every saved point is re-checked afterwards: no swapping, and every block
@@ -69,15 +79,19 @@ averaged.
 | Ginger recommended | 3,140 | 2,263 | 1,347 | 865 | 491 | 0.9984 |
 | Ginger float-rerank | 2,137 | 1,424 | 827 | 517 | 299 | 0.9987 |
 
-**8 clients / threads:**
+**8, 12 and 16 clients / threads** (Postgres client on node-1):
 
-| engine | 0.90 | 0.95 | 0.98 | 0.99 | 0.995 | max recall |
-|---|---:|---:|---:|---:|---:|---:|
-| pgvector HNSW | 1,818 | 1,143 | 615 | 315 | – | 0.9928 |
-| pgvectorfast HNSW | 3,059 | 2,018 | 889 | 530 | – | 0.9928 |
-| PRISM | 1,263 | 999 | 463 | 287 | 186 | 0.9980 |
-| Ginger recommended | 23,025 | 16,375 | 9,640 | 6,226 | 3,536 | 0.9984 |
-| Ginger float-rerank | 15,046 | 9,936 | 5,718 | 3,590 | 2,073 | 0.9987 |
+| engine | 0.95 @ 8 | @ 12 | @ 16 | 8 → 16 | 0.99 @ 8 | @ 12 | @ 16 | 8 → 16 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| pgvector HNSW | 1,452 | 2,060 | 2,454 | +69% | 325 | 385 | 426 | +31% |
+| pgvectorfast HNSW | 2,439 | 2,718 | 2,890 | +18% | 546 | 536 | 526 | −4% |
+| PRISM | 1,071 | 1,213 | 1,344 | +25% | 296 | 311 | 325 | +10% |
+| Ginger recommended | 16,375 | 19,645 | 23,027 | +41% | 6,226 | 7,502 | 8,886 | +43% |
+| Ginger float-rerank | 9,936 | 11,555 | 12,914 | +30% | 3,589 | 4,167 | 4,645 | +29% |
+
+The full curves at each count are in the charts above, and in `bench/results/`.
+The first published version of this file had an 8-client table measured with
+the client on node-0; those numbers are kept under "Where the client runs".
 
 HNSW stops at 0.9928 because `ef_search=1000` is pgvector's maximum.
 
@@ -97,26 +111,46 @@ were lost to a logging bug (see the protocol notes).
 ## What the numbers say
 
 **Ginger is in a different class: about 7.5× pgvectorfast and 15× pgvector at
-0.99 recall with one thread, and 12× / 20× with eight.** The gap is not the
-Postgres boundary:
+0.99 recall with one thread, 11× / 19× with eight, and 17× / 21× with
+sixteen.** The gap is not the Postgres boundary:
 - A trivial prepared query carrying the same 6 KB vector parameter costs
   0.31 ms at 1 client (`index=rtt` rows; 3,084 QPS).
 - Adding that floor to Ginger's 1.16 ms at 0.99 still leaves it about 5.9×
   pgvectorfast and 12× pgvector.
-- At 8 threads, Ginger's QPS scales 7.2× on 8 cores, against 5.5× for
-  pgvector.
+- From 8 clients up, the floor (18,000–29,500 QPS) sits far above every
+  Postgres engine's throughput, so the connection is never the limit there.
 
 **Ginger's recommended config beats its own float rerank by 1.5–1.7× at every
-recall.** It also reaches the same top recall (0.998). Reranking from 12-bit
-TurboQuant codes loses no measurable recall against exact floats, and it
-avoids touching 6 KB of float per candidate. The PCA projection and dropped
-floats cost nothing in quality on this dataset.
+recall.** It also reaches the same top recall (0.998), so PCA and the 12-bit
+rerank cost nothing in quality on this dataset.
 
-**pgvectorfast is 1.45–2.0× stock pgvector at matched recall:**
+The float-rerank config differs in two ways, though: no PCA, and an exact
+float rerank. So the run cannot say which of the two costs the time. The PCA is
+the likely one:
+- The graph search does most of the work. Without PCA it scores 4-bit codes of
+  all 1536 dimensions, about 3× the data per distance.
+- The rerank touches only ~60 candidates per query.
+- At the same beam size, float-rerank is ~1.9× slower but slightly *more*
+  accurate (beam 160: 0.9908 vs 0.9890). That fits a slower, more accurate
+  search, not an expensive final step.
+
+**pgvectorfast is 1.45–2.0× stock pgvector up to 8 clients, but its lead
+shrinks past that:**
 - With 1 client: 1.59× at 0.90, 1.47× at 0.95, 1.45× at 0.98, 2.0× at 0.99.
-- With 8 clients: 1.45–1.77×.
+- With 8 clients: 1.68× at both 0.95 and 0.99.
+- With 16 clients: 1.18× at 0.95 and 1.23× at 0.99. From 8 to 16 clients,
+  pgvectorfast gains 18% at 0.95 and nothing at 0.99, while stock pgvector
+  gains 69% and 31%.
 - Both engines search the same graph and return identical recall at every
   `ef_search` in every round. The difference is purely the buffer manager.
+- **Likely cause of the plateau, not yet profiled:** at high `ef_search` both
+  engines stream a full 6 KB float vector per candidate. Past 8 clients the
+  extra parallelism is hyperthreads only, which add no memory bandwidth.
+  pgvectorfast, doing the same work faster per query, reaches this machine's
+  bandwidth limit first; stock pgvector still has its buffer-manager overhead
+  to hide behind.
+- **Ginger keeps scaling** (+41–43% from 8 to 16 threads). Its 4-bit codes
+  move about 20× less data per candidate.
 
 **PRISM is the slowest engine here.** That reverses BIGANN, where it was 3–5×
 faster than HNSW. `EXPLAIN (ANALYZE, VERBOSE)` on a warm backend, for query 0,
@@ -136,6 +170,44 @@ puts the time in the posting-list scan, not the rerank:
   reverse of BIGANN.
 - **Worth asking the pg_vectorsearch authors** whether the scan path at high
   dimensions on AVX2 is expected to look like this.
+
+## Where the client runs
+
+The first 8-client sweeps ran the Python client on node-0, next to the server:
+8 client processes and 8 backends on 8 cores / 16 hardware threads. To measure
+what that cost, `bench/cloudlab/remote_client.sh` ran the same 8-client sweep
+twice back to back on one warm server per arm, client on node-1 and client on
+node-0, with the order flipped between arms.
+
+| ef_search | recall | pgvectorfast: node-1 / node-0 client | stock pgvector: node-1 / node-0 client |
+|---:|---:|---:|---:|
+| 10 | 0.761 | 5,566 / 4,564 (+22%) | 3,455 / 2,983 (+16%) |
+| 40 | 0.913 | 3,397 / 2,823 (+20%) | 2,179 / 1,666 (+31%) |
+| 80 | 0.951 | 2,415 / 1,976 (+22%) | 1,435 / 1,105 (+30%) |
+| 160 | 0.970 | 1,585 / 1,338 (+18%) | 1,044 / 930 (+12%) |
+| 640 | 0.989 | 585 / 564 (+4%) | 350 / 338 (+3%) |
+| 1000 | 0.993 | 408 / 399 (+2%) | 236 / 232 (+2%) |
+
+- **A local client cost both HNSW arms 12–31% below 0.98 recall**, falling to
+  2–4% at 0.99 and above, where each query spends far longer in the server than
+  in the client.
+- **The network hop itself is negligible.** The round-trip floor is 0.314 ms
+  local and 0.340 ms over the LAN at 1 client (+26 µs). At 8 clients it is
+  0.41 ms either way. The gain is the freed cores, not the network.
+- **PRISM's 8-client curve rose the same way** at low `nprobe` (+38% at
+  `nprobe=5`, +25% at 10) and is unchanged from `nprobe=40` up. Its two
+  placements were measured in separate server sessions rather than back to
+  back.
+- **Conclusions at 0.99 hold either way.** Below ~0.98, the original
+  8-client Postgres curves understated every Postgres engine.
+
+The original 8-client table (client on node-0), for reference:
+
+| engine | 0.90 | 0.95 | 0.98 | 0.99 | 0.995 |
+|---|---:|---:|---:|---:|---:|
+| pgvector HNSW | 1,818 | 1,143 | 615 | 315 | – |
+| pgvectorfast HNSW | 3,059 | 2,018 | 889 | 530 | – |
+| PRISM | 1,263 | 999 | 463 | 287 | 186 |
 
 ## Measurement quality
 
@@ -208,12 +280,26 @@ bench/run_experiment.sh data build pgvectorfast prism_solo overhead
 ./build_ginger.sh && bench/run_ginger.sh
 ./build_postgres.sh && ./build_extensions.sh
 PVF_ARMS="stock stock" bench/run_experiment.sh data build pgvectorfast overhead
-# workstation:
+# workstation, with both nodes set up and node-0's indexes built:
+bench/cloudlab/remote_client.sh    # client placement, 8 clients
+bench/cloudlab/scaling.sh          # 12 and 16 clients, client on node-1
 bench/cloudlab/sync.sh pull
-bench/plot_variants.py dbpedia_openai_1m_1536_angular [--clients 8]
+bench/plot_variants.py dbpedia_openai_1m_1536_angular [--clients 8|12|16]
 ```
 
+`remote_client.sh` and `scaling.sh` run each step detached on its node and
+record its completion in `/mydata/steps/`. A dropped connection or a sleeping
+workstation only pauses them; re-running continues after the last finished
+step.
+
 ## Open
+
+- Confirm what stops pgvectorfast scaling past 8 clients at high recall:
+  measure DRAM bandwidth during the 8- and 16-client sweeps (`perf stat` with
+  uncore counters, after lowering `perf_event_paranoid`).
+- Separate Ginger's PCA from its float rerank with a third config (PCA on,
+  float rerank). The float-rerank config changes both, and its 1.5–1.7×
+  slowdown most likely comes from dropping PCA.
 
 - PRISM's posting-scan cost at 1536-d on AVX2: profile it
   (`perf_event_paranoid` is 4 on these nodes and needs lowering), and try

@@ -89,11 +89,21 @@ BIGANN_NOTE = ("Measured: PRISM, IVFFlat 2026-11-05 · RaBitQ, rabitq-branch pla
 # in pgvector's own hue, so node-to-node agreement reads as two overlapping
 # lines. Ginger runs in-process: its curve does not pay the Postgres round
 # trip that the `rtt` rows of the overhead phase measure.
-BASELINE_HOST = "node-1"
+# Which Postgres rows a view uses. At 1 client the client shares the server's
+# machine (node-0), as in the original sweeps; from 8 clients up it runs on
+# node-1 over the private LAN (labels rc-<arm>-remote at 8, sc-<arm> at 12/16),
+# because a local client competes with the backends for cores and cost both
+# HNSW arms 15-30% of their throughput at moderate recall. A row's `host` is
+# the client's machine, so the 1-client rows are picked by host node-0.
+def pg_arm(arm):
+    return lambda r: (
+        (r["clients"] == 1 and is_label(f"pvf-{arm}")(r) and (r.get("host") or "").startswith("node-0"))
+        or (r["clients"] >= 8 and r.get("label") in (f"rc-{arm}-remote", f"sc-{arm}")))
 
 
-def on_baseline(r) -> bool:
-    return (r.get("host") or r.get("_node") or "").startswith(BASELINE_HOST)
+def prism_rows(r):
+    return ((r["clients"] == 1 and r.get("label") == "prism-solo")
+            or (r["clients"] >= 8 and r.get("label") == "sc-prism"))
 
 
 def ginger(cfg):
@@ -102,23 +112,23 @@ def ginger(cfg):
     return lambda r: r.get("engine") == "ginger" and r.get("label") == f"ginger-{cfg}"
 
 
+# node-1's own stock pgvector run is left off: it only checked that the two
+# nodes are interchangeable (they agree within 1-5% at matched recall; see
+# FINDINGS-dbpedia.md), so it would plot the same curve twice.
 DBPEDIA_SERIES = [
     {"name": "pgvector 0.8.7 HNSW", "short": "pgvector 0.8.7", "index": "hnsw", "agg": "mean",
-     "slot": 1, "match": lambda r: is_label("pvf-stock")(r) and not on_baseline(r)},
+     "slot": 1, "match": pg_arm("stock")},
     {"name": "PRISM (pg_vectorsearch)", "short": "PRISM", "index": "prism", "agg": "mean",
-     "slot": 2, "match": is_label("prism-solo")},
+     "slot": 2, "match": prism_rows},
     {"name": "Ginger (PCA, 4+8-bit TQ)", "short": "Ginger", "index": None,
      "agg": "mean", "slot": 3, "match": ginger("recommended")},
     {"name": "pgvectorfast HNSW", "short": "pgvectorfast", "index": "hnsw", "agg": "mean",
-     "slot": 4, "match": lambda r: is_label("pvf-fast")(r) and not on_baseline(r)},
+     "slot": 4, "match": pg_arm("fast")},
     {"name": "Ginger, float rerank", "short": "Ginger float-rerank", "index": None,
      "agg": "mean", "slot": 3, "dash": True, "match": ginger("float-rerank")},
-    # node-1's stock pgvector rerun is left off: it only checks that the two
-    # nodes are interchangeable (they agree within 1-5% at matched recall; see
-    # FINDINGS-dbpedia.md), so it would plot the same curve twice.
 ]
-DBPEDIA_NOTE = ("m510, Xeon D-1548 @ 2.0 GHz pinned, AVX2. Ginger in-process; Postgres adds a 0.31 ms "
-                "round trip and reads a 7.4 GiB TOAST table not in its size. Rounds averaged.")
+DBPEDIA_NOTE = ("m510, Xeon D-1548 @ 2.0 GHz pinned, AVX2. Ginger in-process. Postgres client local at 1 "
+                "client, on a 2nd node over 10 GbE from 8 up. Rounds averaged.")
 
 BIGANN_TITLE = "18M BIGANN (SIFT), {n} index variants"
 DBPEDIA_TITLE = "DBpedia OpenAI 1M (ada-002, 1536-d), {n} variants"
