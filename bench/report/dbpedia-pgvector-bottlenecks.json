@@ -1,0 +1,242 @@
+{
+ "_about": "Inputs to bench/plot_bottlenecks.py and bench/PGVECTOR-BOTTLENECKS.md. Stock pgvector 0.8.7 HNSW (m=16, ef_construction=64) on DBpedia-OpenAI 1M (975,000 x 1536-d), CloudLab m510 node-0, clock pinned at 2.0 GHz. throughput: bench/results, regular build (1 client: client on node-0; 8+: client on node-1). counters: perf_window.sh (IMC and core counters) during profile_pgvector.sh, frame-pointer build. ceilings_gbps: membw.c. breakdown: perf_categories.py on the 1-client ef_search=640 call graphs. kernel_ns: distbench.c. pages_per_query: explain_buffers.py. counters_pgvectorfast_ef640: same IMC measurement on the pgvectorfast arm.",
+ "throughput": [
+  {
+   "engine": "pgvector 0.8.7",
+   "ef_search": 40,
+   "recall": 0.9131,
+   "clients": 1,
+   "qps": 324.0
+  },
+  {
+   "engine": "pgvector 0.8.7",
+   "ef_search": 40,
+   "recall": 0.9131,
+   "clients": 8,
+   "qps": 2178.9
+  },
+  {
+   "engine": "pgvector 0.8.7",
+   "ef_search": 40,
+   "recall": 0.9131,
+   "clients": 12,
+   "qps": 2775.6
+  },
+  {
+   "engine": "pgvector 0.8.7",
+   "ef_search": 40,
+   "recall": 0.9131,
+   "clients": 16,
+   "qps": 3814.6
+  },
+  {
+   "engine": "pgvector 0.8.7",
+   "ef_search": 640,
+   "recall": 0.9892,
+   "clients": 1,
+   "qps": 60.9
+  },
+  {
+   "engine": "pgvector 0.8.7",
+   "ef_search": 640,
+   "recall": 0.9892,
+   "clients": 8,
+   "qps": 349.7
+  },
+  {
+   "engine": "pgvector 0.8.7",
+   "ef_search": 640,
+   "recall": 0.9892,
+   "clients": 12,
+   "qps": 414.6
+  },
+  {
+   "engine": "pgvector 0.8.7",
+   "ef_search": 640,
+   "recall": 0.9892,
+   "clients": 16,
+   "qps": 457.9
+  },
+  {
+   "engine": "pgvectorfast",
+   "ef_search": 40,
+   "recall": 0.9131,
+   "clients": 1,
+   "qps": 508.3
+  },
+  {
+   "engine": "pgvectorfast",
+   "ef_search": 40,
+   "recall": 0.9131,
+   "clients": 8,
+   "qps": 3396.5
+  },
+  {
+   "engine": "pgvectorfast",
+   "ef_search": 40,
+   "recall": 0.9131,
+   "clients": 12,
+   "qps": 3922.8
+  },
+  {
+   "engine": "pgvectorfast",
+   "ef_search": 40,
+   "recall": 0.9131,
+   "clients": 16,
+   "qps": 4559.6
+  },
+  {
+   "engine": "pgvectorfast",
+   "ef_search": 640,
+   "recall": 0.9892,
+   "clients": 1,
+   "qps": 121.6
+  },
+  {
+   "engine": "pgvectorfast",
+   "ef_search": 640,
+   "recall": 0.9892,
+   "clients": 8,
+   "qps": 584.7
+  },
+  {
+   "engine": "pgvectorfast",
+   "ef_search": 640,
+   "recall": 0.9892,
+   "clients": 12,
+   "qps": 574.3
+  },
+  {
+   "engine": "pgvectorfast",
+   "ef_search": 640,
+   "recall": 0.9892,
+   "clients": 16,
+   "qps": 563.3
+  }
+ ],
+ "counters": [
+  {
+   "clients": 1,
+   "ef_search": 40,
+   "qps": 244.8,
+   "dram_read_gbps": 1.6,
+   "dram_mb_per_query": 6.5,
+   "ipc": 0.9,
+   "mcycles_per_query": 4.0
+  },
+  {
+   "clients": 1,
+   "ef_search": 640,
+   "qps": 55.9,
+   "dram_read_gbps": 3.4,
+   "dram_mb_per_query": 61.4,
+   "ipc": 0.73,
+   "mcycles_per_query": 38.0
+  },
+  {
+   "clients": 8,
+   "ef_search": 40,
+   "qps": 1887.7,
+   "dram_read_gbps": 12.7,
+   "dram_mb_per_query": 6.7,
+   "ipc": 0.89,
+   "mcycles_per_query": 3.4
+  },
+  {
+   "clients": 8,
+   "ef_search": 640,
+   "qps": 324.9,
+   "dram_read_gbps": 18.9,
+   "dram_mb_per_query": 58.0,
+   "ipc": 0.62,
+   "mcycles_per_query": 37.1
+  },
+  {
+   "clients": 16,
+   "ef_search": 40,
+   "qps": 3470.7,
+   "dram_read_gbps": 24.2,
+   "dram_mb_per_query": 7.0,
+   "ipc": 0.48,
+   "mcycles_per_query": 6.4
+  },
+  {
+   "clients": 16,
+   "ef_search": 640,
+   "qps": 446.2,
+   "dram_read_gbps": 27.5,
+   "dram_mb_per_query": 61.5,
+   "ipc": 0.35,
+   "mcycles_per_query": 69.2
+  }
+ ],
+ "ceilings_gbps": {
+  "random_6kb_chunks": {
+   "1": 8.4,
+   "2": 16.0,
+   "4": 26.4,
+   "8": 30.2,
+   "12": 30.2,
+   "16": 30.1
+  },
+  "sequential": {
+   "1": 11.0,
+   "2": 20.3,
+   "4": 33.0,
+   "8": 35.0,
+   "12": 34.6,
+   "16": 34.4
+  },
+  "dram_latency_ns": 167.1
+ },
+ "pages_per_query": {
+  "10": 516,
+  "40": 1060,
+  "160": 2846,
+  "640": 8555,
+  "1000": 12362
+ },
+ "breakdown_1client_ef640": {
+  "server_cpu_ms_per_query": 17.8,
+  "nodes_per_query": 8555,
+  "share_pct": {
+   "Distance (streams the 6 KB vector)": 32.3,
+   "Buffer manager: page lookup": 18.2,
+   "HNSW element and neighbor loading": 17.5,
+   "Buffer manager: pin, locks, refcounts": 15.2,
+   "Executor, protocol, other": 5.7,
+   "Visited set": 5.2,
+   "Kernel": 2.7,
+   "Candidate queues": 2.6,
+   "Memory allocation": 0.4
+  },
+  "page_walk_cycles_pct": 12.7,
+  "dtlb_misses_per_node": 5.5
+ },
+ "kernel_ns": {
+  "pgvector kernel (1 accumulator)": {
+   "cached": 447,
+   "dram": 741
+  },
+  "4 accumulators": {
+   "cached": 131,
+   "dram": 719
+  }
+ },
+ "counters_pgvectorfast_ef640": [
+  {
+   "clients": 8,
+   "qps": 573.6,
+   "dram_read_gbps": 32.9,
+   "dram_mb_per_query": 57.3,
+   "ipc": 0.46
+  },
+  {
+   "clients": 16,
+   "qps": 561.6,
+   "dram_read_gbps": 33.4,
+   "dram_mb_per_query": 59.5,
+   "ipc": 0.21
+  }
+ ]
+}

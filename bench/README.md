@@ -8,6 +8,8 @@ investigation; `REPORT.md` is the older SIFT-1M report. `FINDINGS-dbpedia.md`
 compares Ginger, pgvector, pgvectorfast and PRISM on DBpedia-OpenAI 1M, run on
 two CloudLab nodes with the scripts in `cloudlab/` (`run_ginger.sh` drives
 Ginger; `qdrant:<name>` datasets load Qdrant's benchmark sets).
+`PGVECTOR-BOTTLENECKS.md` is the profile of what limits pgvector's HNSW on that
+dataset.
 
 ## Setup
 

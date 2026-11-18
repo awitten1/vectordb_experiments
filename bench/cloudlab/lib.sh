@@ -26,19 +26,37 @@ ssh_to() {
 }
 say() { printf '\n=== %s  (%s)\n' "$*" "$(date +%H:%M:%S)" >&2; }
 
-# step <node> <name> <command>: run detached in the repo with the DBpedia
-# settings loaded, wait for its marker, print its result rows, fail on error.
-step() {
-  local node="$1" name="$2" cmd="$3" st
-  if [ "$(ssh_to "$node" "cat $STEPS/$name.done 2>/dev/null" || true)" = 0 ]; then
-    say "$name: already done, skipping"
-    return
-  fi
+step_done() {  # step_done <node> <name>: true if the step's marker says it succeeded
+  [ "$(ssh_to "$1" "cat $STEPS/$2.done 2>/dev/null" || true)" = 0 ]
+}
+
+# start_step <node> <name> <command>: launch detached in the repo with the
+# DBpedia settings loaded, and return at once. Pair with wait_step.
+start_step() {
+  local node="$1" name="$2" cmd="$3"
   say "$name on $node"
-  ssh_to "$node" "mkdir -p $STEPS && rm -f $STEPS/$name.done && nohup bash -c $(printf '%q' "$ENVS && $cmd; echo \$? > $STEPS/$name.done") > $STEPS/$name.log 2>&1 < /dev/null &"
-  until st="$(ssh_to "$node" "cat $STEPS/$name.done 2>/dev/null" 2>/dev/null)" && [ -n "$st" ]; do sleep 30; done
+  # Only the redirected nohup goes to the background. Backgrounding an
+  # `a && b && nohup ...` chain would keep SSH's output channel open in the
+  # background subshell, and ssh would not return until the step finished.
+  ssh_to "$node" "mkdir -p $STEPS && rm -f $STEPS/$name.done; nohup bash -c $(printf '%q' "$ENVS && $cmd; echo \$? > $STEPS/$name.done") > $STEPS/$name.log 2>&1 < /dev/null &"
+}
+
+# wait_step <node> <name>: wait for the marker, print result rows, fail on error.
+wait_step() {
+  local node="$1" name="$2" st
+  until st="$(ssh_to "$node" "cat $STEPS/$name.done 2>/dev/null" 2>/dev/null)" && [ -n "$st" ]; do sleep 15; done
   ssh_to "$node" "grep -avE '^\s*[0-9.]*%' $STEPS/$name.log | grep -aE '^ +[0-9-]+ +[0-9.-]+ |^error' || true" >&2 || true
   [ "$st" = 0 ] || { echo "error: step $name failed (exit $st); log: $node:$STEPS/$name.log" >&2; exit 1; }
+}
+
+# step <node> <name> <command>: start_step + wait_step, skipped if already done.
+step() {
+  if step_done "$1" "$2"; then
+    say "$2: already done, skipping"
+    return
+  fi
+  start_step "$@"
+  wait_step "$1" "$2"
 }
 
 # serve_step <name> <arm> [table]: bring node-0's server up as one arm for LAN clients.

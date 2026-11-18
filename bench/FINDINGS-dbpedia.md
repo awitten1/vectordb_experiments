@@ -171,6 +171,126 @@ puts the time in the posting-list scan, not the rerank:
 - **Worth asking the pg_vectorsearch authors** whether the scan path at high
   dimensions on AVX2 is expected to look like this.
 
+## Where pgvector's time goes
+
+The standalone write-up of this section, with figures, is
+[PGVECTOR-BOTTLENECKS.md](PGVECTOR-BOTTLENECKS.md).
+
+Profiled on node-0 with stock pgvector, a frame-pointer build, and the client
+on node-1, so node-0 ran nothing but Postgres. For 1, 8 and 16 clients at
+`ef_search` 40 (recall 0.913) and 640 (0.989), during one steady-state run per
+configuration (`bench/cloudlab/profile_pgvector.sh`), three 20 s windows:
+1. core counters plus DRAM traffic from the memory controllers
+2. Top-Down level 1/2
+3. system-wide call graphs
+
+Plus `EXPLAIN (ANALYZE, BUFFERS)` on 100 queries, the machine's memory
+ceilings (`membw.c`) and a distance-kernel microbenchmark (`distbench.c`).
+
+**Per query, what HNSW touches:**
+
+| ef_search | recall | pages per query (EXPLAIN) | DRAM read per query (IMC) |
+|---:|---:|---:|---:|
+| 40 | 0.913 | 1,060 | 6.5 MB |
+| 640 | 0.989 | 8,555 | 61 MB |
+
+Every visited element is one 8 KB index page holding its 6 KB float vector,
+and nearly every byte of it comes from DRAM: the 7.4 GiB index is 600× the
+12 MiB L3.
+
+**Where the time goes** (share of Postgres CPU time, from the call graphs; the
+split is within a few points across all six configurations):
+
+| category | 1 client, ef 640 | 16 clients, ef 640 |
+|---|---:|---:|
+| distance (`vector_l2_squared_distance`) | 32% | 33% |
+| buffer manager: page lookup (`BufTableLookup` → `hash_search_with_hash_value`) | 18% | 19% |
+| buffer manager: pin/unpin, LWLocks, refcounts, `ReadBuffer` | 15% | 14% |
+| HNSW element and neighbor loading | 18% | 16% |
+| visited set (`tidhash`) | 5% | 7% |
+| candidate queues (pairing heap) | 3% | 3% |
+| executor, protocol, other | 6% | 4% |
+| kernel | 3% | 3% |
+
+At 1 client, `ef_search=640` costs 17.8 ms of server CPU per query, **2.1 µs per
+visited element**: about 0.67 µs distance, 0.7 µs buffer manager, 0.36 µs
+element loading, 0.11 µs visited set. Overlapping all of these, **page-table
+walks take 12.7% of all cycles** (about 5.5 dTLB misses per element, 94 cycles
+per walk). `shared_buffers` is mapped with 4 KB pages; no huge pages are
+reserved.
+
+**Top-Down:** retiring only 16–27% of cycles. Backend-bound 50–75%, of which
+memory-bound 34–61%. Front-end-bound 6–21%.
+
+**The distance kernel is memory-bound, not compute-bound, here:**
+
+| ns per 1536-d distance, 1 thread | cached | from DRAM |
+|---|---:|---:|
+| pgvector's `VectorL2SquaredDistance` (one accumulator) | 447 | 741 |
+| same arithmetic, four accumulators | 131 | 719 |
+
+With the data cached, pgvector's loop is limited by its single accumulator's
+FMA-latency chain (447 ns ≈ 192 FMAs × 4.7 cycles), and four accumulators are
+3.4× faster. From DRAM, the real case, both take about the time to stream
+6 KB: 0.72–0.74 µs, matching the 0.67 µs measured inside queries. A faster
+kernel would not help this workload.
+
+**Concurrency runs into DRAM bandwidth:**
+
+| clients | ef_search | QPS | DRAM read GB/s | IPC | Mcycles per query |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 640 | 56 | 3.4 | 0.73 | 38 |
+| 8 | 640 | 325 | 18.9 | 0.62 | 37 |
+| 16 | 640 | 446 | **27.5** | 0.35 | 69 |
+| 16 | 40 | 3,471 | 24.2 | 0.48 | 6.4 |
+
+The measured ceiling for this access pattern (random 6 KB reads) is 30 GB/s,
+reached at 8 threads; streaming reads reach 35 GB/s. At 61 MB per 0.99-recall
+query, that caps any engine reading these pages at roughly **490–570 QPS**.
+Stock pgvector reaches 446 at 16 clients. pgvectorfast reaches 526–585 from 8
+clients up and goes no further. That is the plateau in the scaling table:
+pgvectorfast removes the buffer-manager third of the CPU cost, so it hits the
+bandwidth ceiling sooner, and the ceiling is the same for both.
+
+**Bottlenecks, in order of how much they limit throughput:**
+
+1. **Bytes per visited element.** A 6 KB float vector per element and ~8,500
+   elements per 0.99-recall query is 61 MB of DRAM traffic per query. This
+   sets the throughput ceiling under concurrency and the largest share of
+   single-query time. Halving bytes per element (`halfvec`) should raise the
+   ceiling about 2×. Compressed codes in the graph, as Ginger stores (about
+   300 B), raise it about 20×.
+2. **The buffer manager per element** (~1/3 of CPU at low concurrency): the
+   `BufTableLookup` hash probe, pin/unpin, LWLocks and private refcounts, for
+   every one of the ~8,500 pages. This is what Calico (pgvectorfast) removes,
+   1.5–2× at 1–8 clients, until bandwidth takes over.
+3. **Page-table walks** (12.7% of cycles), from mapping 28 GB of
+   `shared_buffers` with 4 KB pages. Huge pages for `shared_buffers` should
+   recover most of it. Untested.
+4. **HNSW bookkeeping:** element and neighbor-tuple loading (~17%), the
+   visited set (5–7%), the candidate heaps (~3%).
+5. **Not a bottleneck here:** the distance arithmetic (memory-bound, see
+   above), the kernel, and the executor/protocol (≤6%).
+
+Caveats:
+- Profiling perturbs throughput somewhat. At 1 client:
+  - `ef_search=640`: regular build 60.9 QPS, frame-pointer build unprofiled
+    60.3, with call-graph sampling 55.9 (−8%).
+  - `ef_search=40`: 324, 275 and 245. The unprofiled gap there is within the
+    up-to-17% noise of single-client points.
+
+  Read the profiles for shares of time, not absolute QPS.
+- pgvectorfast was measured the same way at `ef_search=640`. It moves the same
+  57–60 MB per query, and reads **32.9 GB/s at 8 clients and 33.4 GB/s at
+  16**: already at the machine's limit with 8 clients. From 8 to 16, its IPC
+  halves (0.46 → 0.21) for no extra throughput.
+- At light load, `perf stat`'s `cycles` and `ref-cycles` disagree by 2.5×
+  (likely idle cores in the POLL state counting differently), so per-query CPU
+  time above comes from call-graph samples in Postgres processes, not from
+  `cycles`. At 16 clients the counters agree (1.93 GHz).
+- Flame graphs were not rendered; the `perf.data` files are on node-0 under
+  `bench/profiles/pgvector/`.
+
 ## Where the client runs
 
 The first 8-client sweeps ran the Python client on node-0, next to the server:
