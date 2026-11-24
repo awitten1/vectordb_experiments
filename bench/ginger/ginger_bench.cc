@@ -20,6 +20,38 @@
 //   float-rerank  The same graph recipe, but no PCA, no extra bits, and the
 //                 float dataset kept for an exact float rerank -- closer to
 //                 what the Postgres indexes compute.
+//   keep-floats   recommended, but the float dataset is kept, so a search may
+//                 traverse or re-rank with floats (see --traversal, --rerank)
+//   no-compression  recommended without graph compression
+//   no-reorder    recommended without graph reordering or compression
+//
+// Search toggles (default: Ginger's DefaultSearchOptions for the index):
+//   --traversal tq|float      score candidates with 4-bit codes or floats
+//   --rerank tq|float|none    re-rank with 12-bit codes, floats, or not at all
+//   --rerank-factor F         re-rank the top F*k; 0 re-ranks the whole beam
+//   --label NAME              result rows are labelled ginger-NAME (default:
+//                             the config name)
+//
+// Searching a graph built elsewhere (--graph FILE, a graph file written by
+// pgvectorfast's tools/pipnn_export over this dataset's table):
+//   Ginger searches that graph, from its entry point, instead of building or
+//   loading an index. Node i must be dataset row i, as for a table loaded in
+//   dataset order (recall shows it if not).
+//   --search float   float distances, no re-rank: what pgvectorfast's float
+//                    HNSW index computes on the same graph
+//   --search native  Ginger's own search: 4-bit TurboQuant traversal, 12-bit
+//                    re-rank of the top 6k (the recommended config's codes)
+//   Rows are labelled ginger-graph-<float|native>.
+//
+// Instrumentation (off by default; neither changes the timed run):
+//   --stats              after each timed point, one untimed single-thread
+//                        pass over the queries with Ginger's search
+//                        statistics (nodes expanded, candidates, distance
+//                        computations, reranked points); their means go in
+//                        the result row as "stats" and to stderr.
+//   GINGER_PROGRESS=<f>  a thread rewrites <f> every 100 ms with
+//                        "<queries answered> <unix time>", so a profiler
+//                        attached for a window can compute its own QPS.
 
 #include <algorithm>
 #include <atomic>
@@ -51,6 +83,9 @@ using ns = std::chrono::nanoseconds;
 
 namespace {
 
+// Queries answered so far, for GINGER_PROGRESS.
+std::atomic<long> g_answered {0};
+
 struct Options {
     std::string data_dir = "bench/data";
     std::string dataset;
@@ -64,6 +99,13 @@ struct Options {
     float alpha = 1.08f;
     bool rebuild = false;
     bool no_save = false;
+    bool stats = false;
+    std::string graph;            // --graph: search this graph file
+    std::string search = "native";
+    std::string traversal;        // --traversal: "", tq or float
+    std::string rerank;           // --rerank: "", tq, float or none
+    float rerank_factor = -1;     // --rerank-factor: < 0 keeps the default
+    std::string label;            // --label: overrides the config name in labels
 };
 
 [[noreturn]] void die(const std::string& msg) {
@@ -201,7 +243,21 @@ ginger::GingerSearcherConfig make_config(const Options& o, int d) {
         config.set_drop_dataset(false);
         return config;
     }
-    die("unknown --config " + o.config + " (want recommended or float-rerank)");
+    if (o.config == "keep-floats") {
+        config.set_drop_dataset(false);
+        return config;
+    }
+    if (o.config == "no-compression") {
+        config.set_use_graph_compression(false);
+        return config;
+    }
+    if (o.config == "no-reorder") {
+        config.set_use_graph_compression(false);
+        config.set_reordering_algorithm(ginger::REORDERING_ALGORITHM_NONE);
+        return config;
+    }
+    die("unknown --config " + o.config +
+        " (want recommended, float-rerank, keep-floats, no-compression or no-reorder)");
 }
 
 // One sweep point's raw measurements.
@@ -237,6 +293,7 @@ Run run_point(const ginger::GingerSearcher& s, const ginger::SearchOptions& opts
                     const auto t0 = clk::now();
                     absl::StatusOr<std::vector<ginger::DistanceAndId>> r = s.FindNeighbors(
                             absl::MakeConstSpan(xq + size_t(i) * size_t(d), size_t(d)), opts);
+                    g_answered.fetch_add(1, std::memory_order_relaxed);
                     mine.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0)
                                            .count());
                     if (!r.ok()) {
@@ -280,6 +337,13 @@ int main(int argc, char** argv) {
         else if (a == "--alpha") o.alpha = std::stof(next());
         else if (a == "--rebuild") o.rebuild = true;
         else if (a == "--no-save") o.no_save = true;
+        else if (a == "--stats") o.stats = true;
+        else if (a == "--graph") o.graph = next();
+        else if (a == "--search") o.search = next();
+        else if (a == "--traversal") o.traversal = next();
+        else if (a == "--rerank") o.rerank = next();
+        else if (a == "--rerank-factor") o.rerank_factor = std::stof(next());
+        else if (a == "--label") o.label = next();
         else if (a == "--version") {
 #ifdef __AVX512F__
             std::puts("isa: AVX-512");
@@ -332,15 +396,85 @@ int main(int argc, char** argv) {
     ::mkdir(index_dir.c_str(), 0775);
     char alpha_s[16];
     std::snprintf(alpha_s, sizeof alpha_s, "%.2f", o.alpha);
-    const std::string name = "ginger_" + o.config + "_a" + alpha_s;
-    const std::string index_path = index_dir + "/" + o.dataset + "_" + name + ".ginger";
+    const bool graph_mode = !o.graph.empty();
+    if (graph_mode && o.search != "float" && o.search != "native")
+        die("--search must be float or native");
+    const std::string name = graph_mode ? "ginger_graph_" + o.search
+                                        : "ginger_" + o.config + "_a" + alpha_s;
+    const std::string index_path =
+            graph_mode ? o.graph : index_dir + "/" + o.dataset + "_" + name + ".ginger";
+    const std::string label = !o.label.empty() ? o.label : graph_mode ? "graph-" + o.search : o.config;
+    if (!o.traversal.empty() && o.traversal != "tq" && o.traversal != "float")
+        die("--traversal must be tq or float");
+    if (!o.rerank.empty() && o.rerank != "tq" && o.rerank != "float" && o.rerank != "none")
+        die("--rerank must be tq, float or none");
 
     const char* pnt = std::getenv("PARLAY_NUM_THREADS");
     const int build_threads = pnt ? std::atoi(pnt) : int(std::thread::hardware_concurrency());
     std::unique_ptr<ginger::GingerSearcher> searcher;
     double build_s = 0;
 
-    if (exists(index_path) && !o.rebuild) {
+    if (graph_mode) {
+        // Header (see pipnn_export): magic, version, max degree, nodes, entry,
+        // dimensions; then a TID per node; then (max degree + 1) uint32 per
+        // node, degree first -- FlatGraph's own layout.
+        FILE* f = std::fopen(o.graph.c_str(), "rb");
+        if (!f) die("cannot open " + o.graph);
+        char magic[8];
+        uint32_t version = 0, max_degree = 0, dims = 0, reserved = 0;
+        uint64_t num_nodes = 0, entry = 0;
+        if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "PIPNNGR1", 8) != 0 ||
+            std::fread(&version, 4, 1, f) != 1 || version != 1 ||
+            std::fread(&max_degree, 4, 1, f) != 1 || std::fread(&num_nodes, 8, 1, f) != 1 ||
+            std::fread(&entry, 8, 1, f) != 1 || std::fread(&dims, 4, 1, f) != 1 ||
+            std::fread(&reserved, 4, 1, f) != 1)
+            die(o.graph + " is not a graph file written by pipnn_export");
+        // Bit 0 of the last header field: nodes in Ginger's reordered order.
+        // Here node i must be dataset row i, so such a file can't be searched.
+        if (reserved & 1u)
+            die(o.graph + " was written with --reorder: its node i is not dataset row i");
+        if (long(num_nodes) != nb || int(dims) != d)
+            die("the graph file has " + std::to_string(num_nodes) + " nodes of " +
+                std::to_string(dims) + " dimensions; the dataset " + std::to_string(nb) +
+                " of " + std::to_string(d));
+        if (std::fseek(f, long(40 + num_nodes * 8), SEEK_SET) != 0) die("cannot seek in " + o.graph);
+        ginger::FlatGraph g(static_cast<ginger::GingerNodeId>(num_nodes),
+                            static_cast<ginger::GingerNodeId>(max_degree));
+        absl::Span<ginger::GingerNodeId> data = g.MutableData();
+        if (std::fread(data.data(), sizeof(ginger::GingerNodeId), data.size(), f) != data.size())
+            die(o.graph + " ends early");
+        std::fclose(f);
+        for (size_t u = 0; u < num_nodes; u++)
+            if (uint32_t(data[u * (max_degree + 1)]) > max_degree) die("bad degree in " + o.graph);
+
+        // The floats in anonymous memory, not the mmapped file (see below).
+        auto ds = std::make_shared<ginger::SpanDataset>(ginger::GingerNodeId(nb), size_t(d));
+        for (long i = 0; i < nb; i++)
+            ds->Set<float>(ginger::GingerNodeId(i), absl::MakeConstSpan(xb + size_t(i) * size_t(d), size_t(d)));
+
+        ginger::GingerSearcherConfig config;
+        if (o.search == "native") {
+            config = make_config(o, d);  // the recommended config: its TurboQuant codes
+            config.set_reordering_algorithm(ginger::REORDERING_ALGORITHM_NONE);
+            config.set_use_graph_compression(false);
+        } else {
+            config.set_distance_metric(ginger::SQUARED_L2);
+            config.set_drop_dataset(false);
+        }
+        std::fprintf(stderr, "searching %s (%llu nodes, max degree %u, entry %llu), %s search:\n  %s\n",
+                     o.graph.c_str(), (unsigned long long) num_nodes, max_degree,
+                     (unsigned long long) entry, o.search.c_str(), one_line(config).c_str());
+        const auto t0 = clk::now();
+        absl::StatusOr<std::unique_ptr<ginger::GingerSearcher>> s =
+                ginger::GingerSearcherBuilder(config)
+                        .AddDataset(ds)
+                        .AddIndex(std::make_unique<const ginger::FlatGraph>(std::move(g)))
+                        .SetEntryPoint(ginger::GingerNodeId(entry))
+                        .Build();
+        check(s.status(), "Build");
+        std::fprintf(stderr, "prepared in %.1fs\n", std::chrono::duration<double>(clk::now() - t0).count());
+        searcher = *std::move(s);
+    } else if (exists(index_path) && !o.rebuild) {
         std::fprintf(stderr, "reusing %s (pass --rebuild to time a fresh build)\n",
                      index_path.c_str());
         absl::StatusOr<std::unique_ptr<ginger::GingerSearcher>> s =
@@ -398,15 +532,73 @@ int main(int argc, char** argv) {
     }
 
     // ---- sweep ------------------------------------------------------------
+    std::atomic<bool> progress_stop {false};
+    std::thread progress;
+    if (const char* pf = std::getenv("GINGER_PROGRESS"); pf && *pf) {
+        const std::string path = pf, tmp = path + ".tmp";
+        progress = std::thread([&progress_stop, path, tmp] {
+            while (!progress_stop.load()) {
+                if (FILE* f = std::fopen(tmp.c_str(), "w")) {
+                    const double now = std::chrono::duration<double>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                    std::fprintf(f, "%ld %.3f\n", g_answered.load(), now);
+                    std::fclose(f);
+                    std::rename(tmp.c_str(), path.c_str());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
     std::printf("\n%16s %8s %10s %9s %9s %9s\n", "beam_size", "recall", "QPS", "p50 ms",
                 "p95 ms", "p99 ms");
     std::string lines;
     for (int beam : o.sweep) {
         if (beam < o.k) die("beam_size " + std::to_string(beam) + " < k");
-        const ginger::SearchOptions opts = searcher->DefaultSearchOptions(o.k, beam);
+        ginger::SearchOptions opts = searcher->DefaultSearchOptions(o.k, beam);
+        if (graph_mode && o.search == "float") {
+            // pgvectorfast's float index: float distances, no re-rank
+            opts.set_search_space(ginger::SEARCH_SPACE_FLOAT);
+            opts.set_reranking_strategy(ginger::RERANKING_STRATEGY_NONE);
+            opts.clear_rerank_factor();
+        }
+        if (o.traversal == "tq") opts.set_search_space(ginger::SEARCH_SPACE_TURBO_QUANT);
+        if (o.traversal == "float") opts.set_search_space(ginger::SEARCH_SPACE_FLOAT);
+        if (o.rerank == "tq") opts.set_reranking_strategy(ginger::RERANKING_STRATEGY_TURBO_QUANT_EXTRA_BITS);
+        if (o.rerank == "float") opts.set_reranking_strategy(ginger::RERANKING_STRATEGY_FLOAT);
+        if (o.rerank == "none") {
+            opts.set_reranking_strategy(ginger::RERANKING_STRATEGY_NONE);
+            opts.clear_rerank_factor();
+        }
+        if (o.rerank_factor == 0) opts.clear_rerank_factor();
+        if (o.rerank_factor > 0) opts.set_rerank_factor(o.rerank_factor);
         const VmStat vm0 = vmstat();
         Run run = run_point(*searcher, opts, xq, nq, d, o.threads, o.duration);
         const VmStat vm1 = vmstat();
+        std::string stats_json;
+        if (o.stats) {
+            double v = 0, c = 0, dc = 0, fc = 0, rr = 0;
+            for (int i = 0; i < nq; i++) {
+                ginger::BeamSearchResult::Statistics st;
+                absl::StatusOr<std::vector<ginger::DistanceAndId>> r = searcher->FindNeighbors(
+                        absl::MakeConstSpan(xq + size_t(i) * size_t(d), size_t(d)), opts, &st);
+                check(r.status(), "FindNeighbors with statistics");
+                v += double(st.num_nodes_visited);
+                c += double(st.num_candidates_considered);
+                dc += double(st.num_distance_computations);
+                fc += double(st.num_filter_computations);
+                rr += double(st.num_reranked);
+            }
+            char sb[512];
+            std::snprintf(sb, sizeof sb,
+                          "\"stats\":{\"nodes_visited\":%.2f,\"candidates_considered\":%.2f,"
+                          "\"distance_computations\":%.2f,\"filter_computations\":%.2f,"
+                          "\"reranked\":%.2f},",
+                          v / nq, c / nq, dc / nq, fc / nq, rr / nq);
+            stats_json = sb;
+            std::fprintf(stderr, "beam_size %d per query: %.1f nodes expanded, %.1f candidates, "
+                         "%.1f distance computations, %.1f reranked\n",
+                         beam, v / nq, c / nq, dc / nq, rr / nq);
+        }
         const long swapped = (vm1.pswpin - vm0.pswpin) + (vm1.pswpout - vm0.pswpout);
         const long majflt = vm1.pgmajfault - vm0.pgmajfault;
         if (vm0.ok && swapped > 0) {
@@ -451,21 +643,23 @@ int main(int argc, char** argv) {
                 "\"recall\":%.5f,\"qps\":%.2f,\"queries_executed\":%zu,"
                 "\"latency_ms\":{\"mean\":%.4f,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
                 "\"memory\":{\"pswpin\":%ld,\"pswpout\":%ld,\"pgmajfault\":%ld,\"rss_kb\":%ld},"
-                "\"host\":\"%s\",\"timestamp\":\"%s\"}\n",
+                "%s\"host\":\"%s\",\"timestamp\":\"%s\"}\n",
                 json_escape(o.dataset).c_str(), nb, d, nq, o.k, o.threads,
-                o.duration > 0 ? o.duration : 0.0, name.c_str(), o.config.c_str(),
+                o.duration > 0 ? o.duration : 0.0, name.c_str(), label.c_str(),
                 json_escape(config_text).c_str(), json_escape(one_line(opts)).c_str(),
                 o.threads, build_threads,
                 build_s > 0 ? std::to_string(build_s).c_str() : "null", index_bytes, o.alpha,
                 beam, recall, qps, run.lat_ms.size(), mean, percentile(sorted, 50),
                 percentile(sorted, 95), percentile(sorted, 99), vm1.pswpin - vm0.pswpin,
                 vm1.pswpout - vm0.pswpout, majflt, proc_kb("/proc/self/status", "VmRSS"),
-                json_escape(host).c_str(),
+                stats_json.c_str(), json_escape(host).c_str(),
                 iso_now().c_str());
         if (len < 0 || size_t(len) >= sizeof buf) die("result row too long for the buffer");
         lines += buf;
     }
 
+    progress_stop = true;
+    if (progress.joinable()) progress.join();
     if (!o.no_save) {
         FILE* f = std::fopen(o.results.c_str(), "a");
         if (!f) die("cannot append to " + o.results);

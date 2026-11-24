@@ -9,7 +9,7 @@
 #     $libdir/vectorfast. The harness keeps the database bound to $libdir/vector
 #     and swaps the library behind that name, so only Calico's control and SQL
 #     files are installed here.
-#   - builds and installs pg_vectorsearch (PRISM)
+#   - builds and installs pg_vectorsearch (PRISM), unless SKIP_PRISM=1
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -43,6 +43,7 @@ done
 echo "pgvectorfast: $ROOT/pgvectorfast/vectorfast.so (calico files in $EXT)"
 
 # 3. pg_vectorsearch.
+if [ "${SKIP_PRISM:-0}" = 1 ]; then echo "pg_vectorsearch: skipped (SKIP_PRISM=1)"; exit 0; fi
 cd "$ROOT/pg_vectorsearch"
 if [ ! -d builddir ]; then
   meson setup builddir --buildtype=release -Dnative=true -Dpg_config="$PG_CONFIG"

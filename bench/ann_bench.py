@@ -34,9 +34,22 @@ RESULTS_DIR = BENCH_DIR / "results"
 
 DEFAULT_DSN = f"host=localhost port={os.environ.get('PGPORT', '5432')} user=postgres dbname=postgres"
 DEFAULT_SWEEP = {"hnsw": "10,20,40,80,160,320", "ivfflat": "1,2,4,8,16,32,64",
-                 "prism": "5,10,20,40,80,160,320", "none": "0", "rtt": "0"}
+                 "prism": "5,10,20,40,80,160,320", "none": "0", "rtt": "0",
+                 "hnsw_halfvec": "10,20,40,80,160,320", "hnsw_bq": "10,20,40,80,160,320"}
 SEARCH_GUC = {"hnsw": "hnsw.ef_search", "ivfflat": "ivfflat.probes",
-              "prism": "prism.nprobe", "none": None, "rtt": None}
+              "prism": "prism.nprobe", "none": None, "rtt": None,
+              "hnsw_halfvec": "hnsw.ef_search", "hnsw_bq": "hnsw.ef_search"}
+
+# Quantized HNSW variants, built as pgvector expression indexes on the same
+# `embedding` column (pgvector README: "Half-Precision Indexing" and "Binary
+# Quantization"). Each serves only its own query expression, so they can sit on
+# the table next to the plain HNSW index without the planner confusing them;
+# check_plan still verifies it at every point.
+#   hnsw_halfvec  the index stores float16 copies: half the bytes per element
+#   hnsw_bq       the index stores 1 bit per dimension (sign) and is searched by
+#                 Hamming distance; the query fetches ef_search candidates from
+#                 it and re-sorts them by exact distance on the full vectors
+HALFVEC_OPS = {"euclidean": "halfvec_l2_ops", "angular": "halfvec_cosine_ops", "ip": "halfvec_ip_ops"}
 
 # --index rtt: the per-query cost of the Postgres boundary with no search at
 # all. Same client, same prepared-statement path and the same vector parameter
@@ -69,6 +82,25 @@ def order_by(ds, index: str) -> str:
     if index == "prism":
         return f"embedding::vec32 {ds.operator} %s::vec32"
     return f"embedding {ds.operator} %s"
+
+
+def query_sql(ds, index: str, k: int, value) -> tuple[str, int]:
+    """The benchmark query for `index` at search value `value`, and how many
+    times the query vector is passed to it."""
+    table = ident(ds.table)
+    if index == "rtt":
+        return RTT_QUERY, 1
+    if index == "hnsw_halfvec":
+        return (f"SELECT id FROM {table} ORDER BY embedding::halfvec({ds.dim}) {ds.operator} "
+                f"%s::halfvec({ds.dim}) LIMIT {k}"), 1
+    if index == "hnsw_bq":
+        # ef_search candidates by Hamming distance, then exact re-ranking. HNSW
+        # returns at most ef_search rows, so that is also the candidate count.
+        cand = max(int(value), k)
+        return (f"SELECT id FROM (SELECT id, embedding FROM {table} "
+                f"ORDER BY binary_quantize(embedding)::bit({ds.dim}) <~> binary_quantize(%s::vector) "
+                f"LIMIT {cand}) c ORDER BY embedding {ds.operator} %s LIMIT {k}"), 2
+    return f"SELECT id FROM {table} ORDER BY {order_by(ds, index)} LIMIT {k}", 1
 
 
 def main() -> None:
@@ -131,7 +163,7 @@ def main() -> None:
     rows = []
     print_header(guc)
     for value in sweep:
-        if args.index == "hnsw" and value < args.k:
+        if args.index in ("hnsw", "hnsw_halfvec") and value < args.k:
             log(f"warning: ef_search={value} < k={args.k}; HNSW returns at most ef_search rows")
         if args.index != "rtt":
             with connect(args.dsn) as conn:
@@ -162,7 +194,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset", required=True,
                    help="synthetic:<n>x<d>[:<metric>] or an ann-benchmarks name such as sift-128-euclidean")
-    p.add_argument("--index", choices=["hnsw", "ivfflat", "prism", "none", "rtt"], default="hnsw",
+    p.add_argument("--index", choices=["hnsw", "ivfflat", "prism", "none", "rtt", "hnsw_halfvec", "hnsw_bq"],
+                   default="hnsw",
                    help="index to benchmark; 'none' runs exact sequential scans; 'rtt' measures "
                         "the query round trip with no search (default: hnsw)")
     p.add_argument("--k", type=int, default=10, help="neighbors per query (default: 10)")
@@ -181,6 +214,12 @@ def parse_args() -> argparse.Namespace:
     b.add_argument("--rabitq-bits", type=int, default=0,
                    help="HNSW only, experimental (awitten1/pgvector rabitq branch): store RaBitQ "
                         "codes with this many bits per dimension instead of vectors (default: 0, off)")
+    b.add_argument("--quantizer", choices=["tq4"],
+                   help="HNSW only, experimental (pgvector_ntq, awitten1/pgvector hnsw-tq4-nav): "
+                        "store 4-bit TurboQuant navigation codes in the graph instead of vectors")
+    b.add_argument("--rerank", choices=["none", "ntq10", "ntq12", "exact"],
+                   help="with --quantizer: what the final candidates are re-ranked from "
+                        "(pgvector_ntq's default is ntq12)")
     b.add_argument("--rebuild", action="store_true", help="rebuild the index even if it already exists")
     b.add_argument("--keep-other-indexes", action="store_true",
                    help="do not drop the table's other ANN indexes. Off by default because the "
@@ -218,9 +257,13 @@ def parse_args() -> argparse.Namespace:
         EXTRA_SETTINGS[name.strip()] = value.strip()
     if args.rabitq_bits and args.index != "hnsw":
         p.error("--rabitq-bits only applies to --index hnsw")
+    if args.quantizer and args.index != "hnsw":
+        p.error("--quantizer only applies to --index hnsw")
+    if args.rerank and not args.quantizer:
+        p.error("--rerank needs --quantizer")
     if args.index in ("none", "rtt") and args.sweep != "0":
         p.error(f"--sweep has no effect with --index {args.index}")
-    if args.index in INDEX_AMS:
+    if args.index not in ("none", "rtt"):
         # When the vectors are TOASTed (anything over ~2 KB, e.g. 1536-d
         # float4), the heap is a few hundred pages of pointers and the planner
         # prices a seq scan + sort as nearly free: it does not cost detoasting
@@ -254,6 +297,14 @@ def connect(dsn: str) -> psycopg.Connection:
     return conn
 
 
+def protect_indexes() -> bool:
+    """PROTECT_INDEXES=1 (set by bench/cloudlab/hn.env): never drop or rebuild an
+    existing table or ANN index; fail instead. For indexes that take hours to
+    build and are meant to be measured again under other server settings. A
+    missing table or index is still created."""
+    return os.environ.get("PROTECT_INDEXES") == "1"
+
+
 def load_table(conn: psycopg.Connection, ds: datasets.Dataset, reload: bool) -> None:
     table = ident(ds.table)
     exists = conn.execute("SELECT to_regclass(%s) IS NOT NULL", (table,)).fetchone()[0]
@@ -261,7 +312,12 @@ def load_table(conn: psycopg.Connection, ds: datasets.Dataset, reload: bool) -> 
         count = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
         if count == len(ds.train):
             return
+        if protect_indexes():
+            sys.exit(f"error: {table} has {count} rows but the dataset has {len(ds.train)}; "
+                     f"PROTECT_INDEXES=1 refuses to drop and reload it (and its indexes)")
         log(f"{table} has {count} rows, expected {len(ds.train)}; reloading")
+    elif exists and protect_indexes():
+        sys.exit(f"error: PROTECT_INDEXES=1 refuses --reload of {table}")
 
     log(f"loading {len(ds.train)} rows into {table} ...")
     start = time.perf_counter()
@@ -298,10 +354,15 @@ def binary_copy_rows(vectors: np.ndarray, first_id: int) -> bytes:
 
 
 def build_params(args: argparse.Namespace, rows: int) -> dict:
-    if args.index == "hnsw":
+    if args.index.startswith("hnsw"):
         params = {"m": args.m, "ef_construction": args.ef_construction}
         if args.rabitq_bits:
             params["rabitq_bits"] = args.rabitq_bits
+        # Part of the index name, so a quantized index is never mistaken for
+        # (and reused as) the plain one with the same m / ef_construction.
+        if args.quantizer:
+            params["quantizer"] = args.quantizer
+            params["rerank"] = args.rerank or "ntq12"
         return params
     if args.index == "ivfflat":
         lists = args.lists or max(1, rows // 1000 if rows <= 1_000_000 else int(np.sqrt(rows)))
@@ -323,9 +384,15 @@ def ensure_index(conn: psycopg.Connection, ds: datasets.Dataset, args: argparse.
     params = build_params(args, len(ds.train))
     wanted = None
     if args.index != "none":
-        suffix = "_".join(f"{k}{v}" for k, v in params.items())
-        wanted = ident(f"{ds.table}_{args.index}_{suffix}" if suffix
-                       else f"{ds.table}_{args.index}")
+        # quantizer/rerank values are self-describing (tq4, ntq12): no key prefix.
+        suffix = "_".join(f"{v}" if k in ("quantizer", "rerank") else f"{k}{v}" for k, v in params.items())
+        raw = f"{ds.table}_{args.index}_{suffix}" if suffix else f"{ds.table}_{args.index}"
+        # Postgres truncates identifiers past 63 bytes, and the truncated name
+        # would never match `wanted`: the index would be rebuilt on every run.
+        if len(raw) > 63:
+            sys.exit(f"error: index name {raw!r} is {len(raw)} characters; Postgres keeps 63. "
+                     f"Use a shorter --table.")
+        wanted = ident(raw)
 
     existing = [r[0] for r in conn.execute(
         """SELECT i.relname FROM pg_index x
@@ -334,6 +401,11 @@ def ensure_index(conn: psycopg.Connection, ds: datasets.Dataset, args: argparse.
            WHERE x.indrelid = %s::regclass AND am.amname = ANY(%s)""",
         (table, list(INDEX_AMS)),
     )]
+    if protect_indexes():
+        if args.rebuild and wanted in existing:
+            sys.exit(f"error: PROTECT_INDEXES=1 refuses to rebuild {wanted}")
+        # Keep every other index too; check_plan still verifies which one runs.
+        args.keep_other_indexes = True
     for name in existing:
         if name == wanted and not args.rebuild:
             continue
@@ -347,15 +419,21 @@ def ensure_index(conn: psycopg.Connection, ds: datasets.Dataset, args: argparse.
         return None, build
 
     if wanted not in existing or args.rebuild:
-        with_opts = ", ".join(f"{k} = {v}" for k, v in params.items())
+        with_opts = ", ".join(f"{k} = '{v}'" if isinstance(v, str) else f"{k} = {v}"
+                              for k, v in params.items())
         log(f"building {wanted} ...")
         conn.execute(f"SET maintenance_work_mem = '{args.maintenance_work_mem}'")
         conn.execute(f"SET max_parallel_maintenance_workers = {args.parallel_workers}")
-        opclass = PRISM_OPCLASS[ds.metric] if args.index == "prism" else ds.opclass
+        if args.index == "hnsw_halfvec":
+            am, key = "hnsw", f"(embedding::halfvec({ds.dim})) {HALFVEC_OPS[ds.metric]}"
+        elif args.index == "hnsw_bq":
+            am, key = "hnsw", f"(binary_quantize(embedding)::bit({ds.dim})) bit_hamming_ops"
+        else:
+            opclass = PRISM_OPCLASS[ds.metric] if args.index == "prism" else ds.opclass
+            am, key = args.index, f"embedding {opclass}"
         start = time.perf_counter()
         with_clause = f" WITH ({with_opts})" if with_opts else ""
-        conn.execute(f"CREATE INDEX {wanted} ON {table} USING {args.index} "
-                     f"(embedding {opclass}){with_clause}")
+        conn.execute(f"CREATE INDEX {wanted} ON {table} USING {am} ({key}){with_clause}")
         build["build_s"] = round(time.perf_counter() - start, 3)
         build["parallel_workers"] = args.parallel_workers
         log(f"built in {build['build_s']:.1f}s")
@@ -378,11 +456,8 @@ def check_plan(conn, ds, args, index_name, query_vec, guc=None, value=None) -> N
     """
     if guc:
         conn.execute(f"SET {guc} = {value}")
-    plan = "\n".join(r[0] for r in conn.execute(
-        f"EXPLAIN SELECT id FROM {ident(ds.table)} "
-        f"ORDER BY {order_by(ds, args.index)} LIMIT {args.k}",
-        (query_vec,),
-    ))
+    sql, nparams = query_sql(ds, args.index, args.k, value if value is not None else args.k)
+    plan = "\n".join(r[0] for r in conn.execute("EXPLAIN " + sql, (query_vec,) * nparams))
     at = f" at {guc}={value}" if guc else ""
     if index_name and index_name not in plan:
         sys.exit(f"error: the query plan doesn't use {index_name}{at}:\n{plan}\n"
@@ -496,12 +571,9 @@ def run_queries(dsn, ds, test, k, guc, value, clients, duration=0.0, index="hnsw
     wall time in ns from the first query start to the last query end, and the
     total number of queries executed).
     """
-    if index == "rtt":
-        query = RTT_QUERY
-    else:
-        query = f"SELECT id FROM {ident(ds.table)} ORDER BY {order_by(ds, index)} LIMIT {k}"
+    query, nparams = query_sql(ds, index, k, value)
     slices = np.array_split(np.arange(len(test)), clients)
-    jobs = [(dsn, query, guc, value, k, test[s], duration) for s in slices]
+    jobs = [(dsn, query, guc, value, k, test[s], duration, nparams) for s in slices]
 
     if clients == 1:
         outputs = [query_worker(*jobs[0])]
@@ -519,13 +591,13 @@ def run_queries(dsn, ds, test, k, guc, value, clients, duration=0.0, index="hnsw
     return ids, latencies, wall, executed
 
 
-def query_worker(dsn, query, guc, value, k, vectors, duration=0.0, barrier=None):
+def query_worker(dsn, query, guc, value, k, vectors, duration=0.0, nparams=1, barrier=None):
     ids = np.full((len(vectors), k), -1, dtype=np.int64)
     latencies = []
     with connect(dsn) as conn, conn.cursor() as cur:
         if guc:
             conn.execute(f"SET {guc} = {int(value)}")
-        cur.execute(query, (vectors[0],), prepare=True)  # prepare before the clock starts
+        cur.execute(query, (vectors[0],) * nparams, prepare=True)  # prepare before the clock starts
         cur.fetchall()
         if barrier is not None:
             barrier.wait()
@@ -541,7 +613,7 @@ def query_worker(dsn, query, guc, value, k, vectors, duration=0.0, barrier=None)
         while True:
             for i, vec in enumerate(vectors):
                 t0 = time.perf_counter_ns()
-                cur.execute(query, (vec,), prepare=True)
+                cur.execute(query, (vec,) * nparams, prepare=True)
                 rows = cur.fetchall()
                 latencies.append(time.perf_counter_ns() - t0)
                 # ids is overwritten on every pass; the queries are identical,

@@ -170,6 +170,11 @@ PY
 # already has the configuration a phase wants, keep it.
 start_server() {
   local sb="$1" mwm="$2"; shift 2
+  # EXTRA_PG_OPTS: more server settings for every start, e.g. to re-measure an
+  # existing index under another configuration ("-c huge_pages=on"). Part of
+  # the stamp below, so changing it restarts the server.
+  # shellcheck disable=SC2086  # split on purpose
+  set -- "$@" ${EXTRA_PG_OPTS:-}
   local want="shared_buffers=$sb maintenance_work_mem=$mwm $*"
   local stamp="$PGDATA_DIR/.bench_server_opts"
 
@@ -328,12 +333,25 @@ print(f"{ds.name}: train={ds.train.shape} test={ds.test.shape} "
 PY
 }
 
+# BUILD_TABLE builds on another copy of the dataset's table (e.g. PIPNN_TABLE)
+# instead of its own; BUILD_DROP="<index> ..." drops those indexes on that
+# table first (each named in full), e.g. to make room on /mydata.
 phase_build() {
+  local d t="${BUILD_TABLE:-}"
+  # Build with stock pgvector even if a pgvectorfast arm was served last.
+  [ -n "${STOCK_SO:-}" ] && install_stock_so
   dsm_preflight
   start_server "$BUILD_SB" "$BUILD_MWM"
-  say "loading table and building HNSW (m=$M, ef_construction=$EF_CONSTRUCTION, $WORKERS workers)"
+  for d in ${BUILD_DROP:-}; do
+    [ -n "$t" ] || die "BUILD_DROP needs BUILD_TABLE"
+    [ "$("${PSQL[@]}" -At -c "SELECT count(*) FROM pg_index WHERE indexrelid = to_regclass('$d') AND indrelid = '$t'::regclass")" = 1 ] ||
+      { say "$d does not exist on $t; nothing to drop"; continue; }
+    say "dropping $d (BUILD_DROP)"
+    "${PSQL[@]}" -c "DROP INDEX $d"
+  done
+  say "loading table and building HNSW on ${t:-$(dataset_table)} (m=$M, ef_construction=$EF_CONSTRUCTION, $WORKERS workers)"
   # One sweep point so the run is a complete, saved record of the build.
-  bench --index hnsw $(index_args) \
+  bench --index hnsw $(index_args) ${t:+--table "$t"} \
         --maintenance-work-mem "$BUILD_MWM" --parallel-workers "$WORKERS" \
         --sweep "$PROFILE_EF" --num-queries 100 ${REBUILD:+--rebuild} --no-save
   if grep -qi 'no longer fits' "$PGDATA_DIR/log" 2>/dev/null; then
@@ -342,7 +360,7 @@ phase_build() {
   else
     echo "no spill: the graph stayed in maintenance_work_mem" >&2
   fi
-  report_sizes
+  report_sizes ${t:+"$t"}
 }
 
 phase_query() {
@@ -554,6 +572,24 @@ PVF_EF_SWEEP="${PVF_EF_SWEEP:-10,20,40,80,160,320,640,1000}"
 PVF_CLIENTS="${PVF_CLIENTS:-1,8}"
 STOCK_SO="${STOCK_SO:-}"                 # a stock pgvector vector.so (e.g. v0.8.7)
 FAST_SO="${FAST_SO:-$ROOT/pgvectorfast/vectorfast.so}"
+# The ntq arm: pgvector_ntq (4-bit TurboQuant navigation codes, built in-tree by
+# build_ntq.sh) serving a quantized HNSW index on its own copy of the table,
+# NTQ_TABLE, built with NTQ_ARGS (e.g. "--quantizer tq4 --rerank ntq12").
+NTQ_SO="${NTQ_SO:-$ROOT/pgvector_ntq/vector.so}"
+NTQ_TABLE="${NTQ_TABLE:-}"
+NTQ_ARGS="${NTQ_ARGS:-}"
+# The fastntq arm: pgvectorfast with pgvector_ntq's TurboQuant read path
+# (build_fastntq.sh), serving the ntq arm's quantized index on NTQ_TABLE.
+FASTNTQ_SO="${FASTNTQ_SO:-$ROOT/pgvectorfast_ntq/vectorfast.so}"
+
+# The table an arm is measured on, and the extra ann_bench arguments it needs.
+arm_table() {
+  case "$1" in
+    ntq|fastntq) printf '%s' "${NTQ_TABLE:?set NTQ_TABLE for the $1 arm}" ;;
+    *) dataset_table ;;
+  esac
+}
+arm_args() { case "$1" in ntq|fastntq) printf -- '--table %s %s' "$NTQ_TABLE" "$NTQ_ARGS" ;; esac; true; }
 
 # Bring the query server up as one pgvector arm (stock | fast) on the shared
 # HNSW index, prewarmed. Extra arguments are passed to start_server, e.g. a
@@ -575,16 +611,23 @@ serve_arm() {
     fast)  install -m755 "$FAST_SO" "$lib/vectorfast.so"
            ln -s vectorfast.so "$lib/vector.so"
            preload="-c shared_preload_libraries=vectorfast" ;;
-    *) die "unknown arm '$arm' (want stock or fast)" ;;
+    ntq)   [ -f "$NTQ_SO" ] || die "no $NTQ_SO; run ./build_ntq.sh"
+           install -m755 "$NTQ_SO" "$lib/vector.so" ;;
+    fastntq) [ -f "$FASTNTQ_SO" ] || die "no $FASTNTQ_SO; run ./build_fastntq.sh"
+           install -m755 "$FASTNTQ_SO" "$lib/vectorfast.so"
+           ln -s vectorfast.so "$lib/vector.so"
+           preload="-c shared_preload_libraries=vectorfast" ;;
+    *) die "unknown arm '$arm' (want stock, fast, ntq or fastntq)" ;;
   esac
   # shellcheck disable=SC2086  # preload is split on purpose
   start_server "$QUERY_SB" 2GB -c max_parallel_workers_per_gather=0 $preload "$@"
-  if [ "$arm" = fast ]; then
+  if [ "$arm" = fast ] || [ "$arm" = fastntq ]; then
     "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS calico" -c "CALL calico.activate()" >/dev/null
     [ "$("${PSQL[@]}" -At -c 'SELECT calico.status()')" = calico ] ||
       die "calico did not activate"
   fi
-  prewarm_or_die
+  # A restart empties shared_buffers, so only the arm's own table is loaded.
+  prewarm_or_die "$(arm_table "$arm")"
 }
 
 # Leave the server up as one arm (SERVE_ARM=stock|fast), reachable from a
@@ -627,6 +670,13 @@ phase_pgvectorfast() {
     [ "$(nm "$FAST_SO" | grep -c ' calico_')" -gt 0 ] || die "$FAST_SO has no calico symbols"
   fi
   [ "$(nm "$STOCK_SO" | grep -c ' calico_' || true)" -eq 0 ] || die "$STOCK_SO has calico symbols"
+  if [[ " $PVF_ARMS " == *" ntq "* ]]; then
+    [ -f "$NTQ_SO" ] || die "no $NTQ_SO; run ./build_ntq.sh"
+  fi
+  if [[ " $PVF_ARMS " == *" fastntq "* ]]; then
+    [ -f "$FASTNTQ_SO" ] || die "no $FASTNTQ_SO; run ./build_fastntq.sh"
+    [ "$(nm "$FASTNTQ_SO" | grep -c ' HnswTqRerankFast$')" -gt 0 ] || die "$FASTNTQ_SO has no TurboQuant read path"
+  fi
 
   local arm round=0 c
   for arm in $PVF_ARMS; do
@@ -634,8 +684,11 @@ phase_pgvectorfast() {
     serve_arm "$arm"
     for c in ${PVF_CLIENTS//,/ }; do
       say "arm $round ($arm): HNSW ef_search sweep ($PVF_EF_SWEEP), $c client(s), ${DURATION}s per point"
-      BENCH_LABEL="pvf-$arm-r$round" \
-        bench --index hnsw $(index_args) --sweep "$PVF_EF_SWEEP" --clients "$c" \
+      # PVF_LABEL: the label prefix (default pvf), so a re-run under other
+      # server settings (EXTRA_PG_OPTS) stays apart from the original rounds.
+      # shellcheck disable=SC2046  # arm_args is split on purpose
+      BENCH_LABEL="${PVF_LABEL:-pvf}-$arm-r$round" \
+        bench --index hnsw $(index_args) $(arm_args "$arm") --sweep "$PVF_EF_SWEEP" --clients "$c" \
               --num-queries "$NUM_QUERIES" --duration "$DURATION"
     done
   done
@@ -739,6 +792,157 @@ phase_pvf_ablation() {
   done
 }
 
+# Build the two quantized HNSW variants next to the plain HNSW index on the
+# same table: hnsw_halfvec (float16 copies in the index) and hnsw_bq (1-bit
+# binary quantization, re-ranked by exact distance at query time). Same m and
+# ef_construction as the plain index. --keep-other-indexes keeps all three:
+# each serves only its own query expression, and check_plan verifies that.
+phase_build_quant() {
+  [ -n "${STOCK_SO:-}" ] && install_stock_so
+  dsm_preflight
+  start_server "$BUILD_SB" "$BUILD_MWM"
+  local kind
+  for kind in ${QUANT_KINDS:-hnsw_halfvec hnsw_bq}; do
+    say "building $kind (m=$M, ef_construction=$EF_CONSTRUCTION, $WORKERS workers)"
+    bench --index "$kind" $(index_args) --keep-other-indexes \
+          --maintenance-work-mem "$BUILD_MWM" --parallel-workers "$WORKERS" \
+          --sweep 40 --num-queries 100 ${REBUILD:+--rebuild} --no-save
+  done
+  report_sizes
+}
+
+# Build the quantized HNSW index for the ntq arm: NTQ_TABLE, a second copy of
+# the dataset (loaded by ann_bench if absent), gets an index built with
+# NTQ_ARGS under pgvector_ntq. Same m / ef_construction as the plain index.
+# The stock and fast libraries do not understand the quantized format, so
+# autovacuum is switched off on this table: it must never open the index
+# while one of them is loaded.
+phase_build_tq() {
+  [ -f "$NTQ_SO" ] || die "no $NTQ_SO; run ./build_ntq.sh"
+  [ -n "$NTQ_TABLE" ] && [ -n "$NTQ_ARGS" ] || die "set NTQ_TABLE and NTQ_ARGS"
+  local lib; lib="$("$BIN/pg_config" --pkglibdir)"
+  stop_server
+  rm -f "$lib/vector.so"
+  install -m755 "$NTQ_SO" "$lib/vector.so"
+  dsm_preflight
+  start_server "$BUILD_SB" "$BUILD_MWM"
+  say "loading $NTQ_TABLE and building quantized HNSW ($NTQ_ARGS, m=$M, ef_construction=$EF_CONSTRUCTION, $WORKERS workers)"
+  # shellcheck disable=SC2086  # NTQ_ARGS is split on purpose
+  bench --index hnsw $(index_args) --table "$NTQ_TABLE" $NTQ_ARGS \
+        --maintenance-work-mem "$BUILD_MWM" --parallel-workers "$WORKERS" \
+        --sweep "$PROFILE_EF" --num-queries 100 --no-save
+  "${PSQL[@]}" -c "ALTER TABLE $NTQ_TABLE SET (autovacuum_enabled = false)"
+  if grep -qi 'no longer fits' "$PGDATA_DIR/log" 2>/dev/null; then
+    echo "warning: a build spilled out of maintenance_work_mem (see $PGDATA_DIR/log)" >&2
+  fi
+  report_sizes "$NTQ_TABLE"
+}
+
+# The PiPNN arm (bench/cloudlab/hn_pipnn.sh): pgvectorfast whose graph was
+# built by Ginger's PiPNN instead of by HNSW insertion, on its own copy of the
+# table (PIPNN_TABLE). FAST_SO must be a pgvectorfast with hnsw.build_graph_file
+# (the awitten1/pgvectorfast fork); PIPNN_BIN is its tools/pipnn_export.
+#   1. load PIPNN_TABLE with ann_bench's row encoder (same ids and rows as the
+#      dataset's table), as an UNLOGGED table: neither the 42 GB load nor the
+#      index build writes WAL, which /mydata has no room for. Reads are the same;
+#      Postgres empties an unlogged table and its index after a crash or an
+#      immediate shutdown (a clean stop keeps them).
+#   2. pipnn_export: SELECT ctid, embedding out of it, build the PiPNN graph
+#      with Ginger's recommended config, write PIPNN_GRAPH (kept and reused;
+#      CREATE INDEX checks every TID against the table)
+#   3. CREATE INDEX ... WITH (m = PIPNN_M) with hnsw.build_graph_file set: the
+#      graph becomes layer 0 (2m neighbours per element), every element on it.
+#      Serial and streaming (~42 bytes of memory per row). PIPNN_REBUILD=1
+#      drops the index first.
+# The index is named as ann_bench expects (<table>_hnsw_m<M>_ef_construction64),
+# so a sweep with --table PIPNN_TABLE --m PIPNN_M reuses it.
+#
+# PIPNN_QUANTIZER=tq4 (with PIPNN_RERANK, default ntq12) builds the TurboQuant
+# variant instead (FAST_SO must be a fork with quantizer = 'tq4'), named as
+# ann_bench --quantizer tq4 --rerank ntq12 expects. PIPNN_DROP="<index> ..."
+# drops those indexes first (each named in full; they must be on PIPNN_TABLE):
+# /mydata has no room for both the float and the tq4 index.
+phase_build_pipnn() {
+  [ -n "${PIPNN_TABLE:-}" ] && [ -n "${PIPNN_GRAPH:-}" ] || die "set PIPNN_TABLE and PIPNN_GRAPH"
+  [ -x "${PIPNN_BIN:-}" ] || die "PIPNN_BIN (${PIPNN_BIN:-unset}) is not an executable pipnn_export"
+  [ -f "$FAST_SO" ] || die "no $FAST_SO"
+  [ "$(strings "$FAST_SO" | grep -c hnsw.build_graph_file)" -gt 0 ] ||
+    die "$FAST_SO has no hnsw.build_graph_file; build the pgvectorfast fork"
+  local lib m="${PIPNN_M:-32}" mwm="${PIPNN_MWM:-8GB}" idx with d
+  idx="${PIPNN_TABLE}_hnsw_m${m}_ef_construction64"
+  with="m = $m, ef_construction = 64"
+  if [ -n "${PIPNN_QUANTIZER:-}" ]; then
+    idx="${idx}_${PIPNN_QUANTIZER}_${PIPNN_RERANK:-ntq12}"
+    with="$with, quantizer = '$PIPNN_QUANTIZER', rerank = '${PIPNN_RERANK:-ntq12}'"
+  fi
+  lib="$("$BIN/pg_config" --pkglibdir)"
+  stop_server
+  rm -f "$lib/vector.so"
+  install -m755 "$FAST_SO" "$lib/vectorfast.so"
+  ln -s vectorfast.so "$lib/vector.so"
+  start_server "$BUILD_SB" "$mwm" -c shared_preload_libraries=vectorfast
+
+  say "loading $PIPNN_TABLE ($DATASET), unlogged"
+  mkdir -p "$(dirname "$PIPNN_GRAPH")"
+  "$PY" - "$DATASET" "$PIPNN_TABLE" "$NUM_QUERIES" "$BENCH" <<'PY'
+import sys
+import time
+import psycopg
+sys.path.insert(0, sys.argv[4])
+import ann_bench, datasets
+ds = datasets.load(sys.argv[1], num_queries=int(sys.argv[3]))
+table = ann_bench.ident(sys.argv[2])
+with psycopg.connect(ann_bench.DEFAULT_DSN, autocommit=True) as conn:
+    if conn.execute("SELECT to_regclass(%s) IS NOT NULL", (table,)).fetchone()[0]:
+        count = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        if count != len(ds.train):
+            sys.exit(f"error: {table} has {count} rows, the dataset {len(ds.train)}; drop it to reload")
+        print(f"{table} already loaded ({count} rows)")
+        sys.exit(0)
+    start = time.perf_counter()
+    conn.execute(f"CREATE UNLOGGED TABLE {table} (id int4 NOT NULL, embedding vector({ds.dim}) NOT NULL)")
+    with conn.cursor() as cur, cur.copy(f"COPY {table} (id, embedding) FROM STDIN WITH (FORMAT BINARY)") as copy:
+        copy.write(b"PGCOPY\n\xff\r\n\x00" + b"\x00" * 8)
+        for row in range(0, len(ds.train), 50_000):
+            copy.write(ann_bench.binary_copy_rows(ds.train[row : row + 50_000], row))
+        copy.write(b"\xff\xff")
+    conn.execute(f"ANALYZE {table}")
+    print(f"loaded {len(ds.train)} rows into {table} in {time.perf_counter() - start:.0f} s")
+PY
+  "${PSQL[@]}" -c "ALTER TABLE $PIPNN_TABLE SET (autovacuum_enabled = false)"
+
+  for d in ${PIPNN_DROP:-}; do
+    [ "$d" != "$idx" ] || die "PIPNN_DROP names the index being built ($idx); use PIPNN_REBUILD"
+    [ "$("${PSQL[@]}" -At -c "SELECT count(*) FROM pg_index WHERE indexrelid = to_regclass('$d') AND indrelid = '$PIPNN_TABLE'::regclass")" = 1 ] ||
+      { say "$d does not exist on $PIPNN_TABLE; nothing to drop"; continue; }
+    say "dropping $d (PIPNN_DROP)"
+    "${PSQL[@]}" -c "DROP INDEX $d"
+  done
+  if [ "${PIPNN_REBUILD:-0}" = 1 ]; then
+    say "dropping $idx to rebuild it"
+    "${PSQL[@]}" -c "DROP INDEX IF EXISTS $idx"
+  fi
+  if [ "$("${PSQL[@]}" -At -c "SELECT to_regclass('$idx') IS NOT NULL")" = t ]; then
+    say "reusing $idx"
+  else
+    if [ -s "$PIPNN_GRAPH" ]; then
+      say "reusing graph file $PIPNN_GRAPH"
+    else
+      say "exporting $PIPNN_TABLE and building its PiPNN graph -> $PIPNN_GRAPH"
+      "$PIPNN_BIN" --conninfo "host=localhost port=$PGPORT user=postgres dbname=postgres" \
+        --table "$PIPNN_TABLE" --column embedding --out "$PIPNN_GRAPH"
+    fi
+    say "CREATE INDEX $idx from the graph file ($with, maintenance_work_mem=$mwm)"
+    "${PSQL[@]}" -v ON_ERROR_STOP=1 <<SQL
+SET maintenance_work_mem = '$mwm';
+SET hnsw.build_graph_file = '$PIPNN_GRAPH';
+\\timing on
+CREATE INDEX $idx ON $PIPNN_TABLE USING hnsw (embedding vector_l2_ops) WITH ($with);
+SQL
+  fi
+  report_sizes "$PIPNN_TABLE"
+}
+
 # Install STOCK_SO as the server's vector.so, replacing a pgvectorfast symlink
 # if one is there. A preload of vectorfast cannot be undone without a restart,
 # so the server is stopped first whenever the library actually changes.
@@ -835,8 +1039,8 @@ printf 'phases: %s\n' "${PHASES[*]}" >&2
 START=$SECONDS
 for p in "${PHASES[@]}"; do
   case "$p" in
-    data|build|query|concurrency|ivfflat|exact|profile|compare|build_prism|rabitq|pgvectorfast|pvf_ablation|prism_solo|overhead|serve) "phase_$p" ;;
-    *) die "unknown phase '$p' (want: data build query concurrency profile build_prism compare ivfflat exact rabitq pgvectorfast pvf_ablation prism_solo overhead serve)" ;;
+    data|build|query|concurrency|ivfflat|exact|profile|compare|build_prism|rabitq|pgvectorfast|pvf_ablation|prism_solo|overhead|serve|build_quant|build_tq|build_pipnn) "phase_$p" ;;
+    *) die "unknown phase '$p' (want: data build query concurrency profile build_prism compare ivfflat exact rabitq pgvectorfast pvf_ablation prism_solo overhead serve build_quant build_tq build_pipnn)" ;;
   esac
 done
 

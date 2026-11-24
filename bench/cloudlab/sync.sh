@@ -5,7 +5,7 @@
 #   bench/cloudlab/sync.sh push            # workstation -> both nodes
 #   bench/cloudlab/sync.sh pull            # both nodes' bench/results -> bench/results/<host>/
 #
-# Env: NODES (default "ms0931 ms0905"), KEY (default ~/.ssh/cloudlab),
+# Env: NODES (default "$SERVER $CLIENT"), DOMAIN (default utah.cloudlab.us), KEY (default ~/.ssh/cloudlab),
 #      REMOTE_USER (default awitt), DEST (default /mydata/vectordb_experiments)
 #
 # rsync rather than git clone: the code under test is usually uncommitted, and
@@ -13,16 +13,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-NODES="${NODES:-ms0931 ms0905}"
+NODES="${NODES:-${SERVER:-ms0818} ${CLIENT:-ms0841}}"
 KEY="${KEY:-$HOME/.ssh/cloudlab}"
 REMOTE_USER="${REMOTE_USER:-awitt}"
 DEST="${DEST:-/mydata/vectordb_experiments}"
-SSH="ssh -i $KEY -o BatchMode=yes"
+DOMAIN="${DOMAIN:-utah.cloudlab.us}"
+SSH="ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm-%C -o ControlPersist=30m"
 
 case "${1:-}" in
   push)
     for n in $NODES; do
-      host="$REMOTE_USER@$n.utah.cloudlab.us"
+      host="$REMOTE_USER@$n.$DOMAIN"
       echo "=== push -> $n:$DEST" >&2
       # Nothing that is built, downloaded or measured on the node goes over.
       rsync -az --delete -e "$SSH" \
@@ -40,7 +41,7 @@ case "${1:-}" in
     ;;
   pull)
     for n in $NODES; do
-      host="$REMOTE_USER@$n.utah.cloudlab.us"
+      host="$REMOTE_USER@$n.$DOMAIN"
       echo "=== pull <- $n:$DEST/bench/results" >&2
       mkdir -p "$ROOT/bench/results/$n"
       rsync -az -e "$SSH" "$host:$DEST/bench/results/" "$ROOT/bench/results/$n/"

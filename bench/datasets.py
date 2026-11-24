@@ -18,6 +18,15 @@ Two kinds of dataset names are supported:
       L2 after asserting unit norms; exact top-100 is recomputed locally and
       checked against the published top-10.
 
+  hackernews[:<n>]                e.g. hackernews, hackernews:1000000
+      ClickHouse's Hacker News embeddings (28.7M posts, 384-d
+      all-MiniLM-L6-v2, published as cosine, unit-norm so served under L2).
+      There is no published query set or ground truth: exact duplicate
+      vectors are dropped, a fixed seeded pool of HN_HOLDOUT rows is held out
+      as queries (skipping any whose top-10 is a tie), and exact top-100 is
+      computed locally. <n> takes a seeded
+      random subset of the base (queries unchanged), for smoke runs.
+
   <ann-benchmarks name>           e.g. sift-128-euclidean, glove-100-angular
       Downloaded once from ann-benchmarks.com into bench/data/. These files
       ship with precomputed exact neighbors.
@@ -103,6 +112,8 @@ def load(name: str, seed: int = 42, num_queries: int = 1000) -> Dataset:
         return _load_bigann(name, num_queries)
     if name.startswith("qdrant:"):
         return _load_qdrant(name, num_queries)
+    if name == "hackernews" or name.startswith("hackernews:"):
+        return _load_hackernews(name, num_queries)
     return _load_ann_benchmarks(name)
 
 
@@ -439,6 +450,233 @@ def _assert_unit_norm(x: np.ndarray, what: str) -> None:
     if worst > UNIT_NORM_TOL:
         raise ValueError(f"{what} are not unit-normalized (max |norm-1| = {worst:.3g}); "
                          f"L2 would not rank like cosine")
+
+
+# --- Hacker News (ClickHouse) ------------------------------------------------
+
+HN_URL = "https://clickhouse-datasets.s3.amazonaws.com/hackernews-miniLM/hackernews_part_1_of_1.parquet"
+HN_NAME = "hackernews_minilm_384"
+HN_DIM = 384
+# Rows held out of the base set as the query pool. Fixed, so the base set does
+# not depend on --num-queries: the queries are the first num_queries of the pool.
+HN_HOLDOUT = 10_000
+HN_SEED = 20261119
+# A query is kept only if its nearest base vector is at least HN_TIE_EPS away
+# and its HN_TIE_K-th and next neighbours differ by at least HN_TIE_EPS (L2, on
+# unit vectors). Float-noise copies of one text sit ~1e-7 apart.
+HN_TIE_K = 10
+HN_TIE_EPS = 1e-5
+
+
+def _load_hackernews(name: str, num_queries: int) -> Dataset:
+    """Hacker News posts embedded with all-MiniLM-L6-v2, served under L2.
+
+    The vectors are unit-norm (asserted), so L2 ranks exactly like the
+    published cosine and Ginger computes the same metric as Postgres.
+
+    Preparation (once, cached in bench/data/):
+      - download the 59 GB Parquet (resumable) and stream its `vector` column
+        into a float32 file, in the file's row order;
+      - order rows by the `id` column, so the dataset does not depend on how the
+        Parquet happens to be laid out;
+      - drop exact duplicate vectors, keeping the lowest id. HN repeats a lot of
+        text (empty comments, reposts), and identical vectors make the top-10
+        boundary a tie, which turns recall@10 into a coin flip for every engine;
+      - hold out HN_HOLDOUT rows, chosen with a fixed seed, as the query pool.
+    The base is everything else. Row i of the base is Postgres id i; the
+    original HN ids are kept in <name>_ids.npy.
+    """
+    m = re.fullmatch(r"hackernews(?::(\d+))?", name)
+    if not m:
+        raise ValueError(f"bad hackernews spec {name!r}, expected hackernews or hackernews:<n>")
+    if num_queries > HN_HOLDOUT:
+        raise ValueError(f"hackernews holds out {HN_HOLDOUT} queries, asked for {num_queries}")
+    subset = int(m.group(1)) if m.group(1) else None
+    full_name = HN_NAME if subset is None else f"{HN_NAME}_{subset}"
+    metric = "euclidean"
+    train_path = DATA_DIR / f"{full_name}_train.npy"
+    meta_path = DATA_DIR / f"{full_name}_meta.npz"
+
+    if train_path.exists() and meta_path.exists():
+        z = np.load(meta_path)
+        if len(z["test"]) >= num_queries:
+            train = np.load(train_path, mmap_mode="r")
+            return Dataset(full_name, train, z["test"], z["neighbors"], metric)
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _hn_prepare()
+    pool = np.load(DATA_DIR / f"{HN_NAME}_pool.npy")
+    stats = dict(np.load(DATA_DIR / f"{HN_NAME}_prep.npz"))
+    if subset is not None and not train_path.exists():
+        _hn_subset(subset, train_path)
+    train = np.load(train_path, mmap_mode="r")
+
+    # Exact deduplication misses near-copies: the same text embedded twice can
+    # differ by float noise (~1e-7). A query that has such a copy in the base,
+    # or whose 10th and 11th neighbours are such copies of each other, has no
+    # well-defined top-10, and recall@10 would charge every engine for a coin
+    # flip. So candidates are taken from the pool in order and kept only if
+    # their ground truth is unambiguous; the kept set is a prefix-stable
+    # function of the pool, whatever num_queries is.
+    k = min(GT_K, len(train))
+    kept_q, kept_n, rejected, start = [], [], 0, 0
+    while len(kept_q) < num_queries:
+        want = num_queries - len(kept_q)
+        cand = pool[start : start + want + want // 4 + 16]
+        if len(cand) == 0:
+            raise ValueError(f"{full_name}: only {len(kept_q)} of {HN_HOLDOUT} pool queries have an "
+                             f"unambiguous top-{HN_TIE_K}; asked for {num_queries}")
+        start += len(cand)
+        cand = np.ascontiguousarray(cand, dtype=np.float32)
+        print(f"computing exact L2 neighbors for {len(cand)} queries over {len(train)} vectors ...", file=sys.stderr)
+        nbrs = exact_neighbors(train, cand, metric, k)
+        for q, nb in zip(cand, nbrs):
+            # Exact float64 distances, re-sorted: sgemm's ranking can swap near ties.
+            d = np.linalg.norm(np.asarray(train[nb], dtype=np.float64) - q.astype(np.float64), axis=1)
+            o = np.argsort(d, kind="stable")
+            d, nb = d[o], nb[o]
+            if d[0] < HN_TIE_EPS or (len(d) > HN_TIE_K and d[HN_TIE_K] - d[HN_TIE_K - 1] < HN_TIE_EPS):
+                rejected += 1
+                continue
+            if len(kept_q) < num_queries:
+                kept_q.append(q)
+                kept_n.append(nb)
+    test = np.stack(kept_q)
+    neighbors = np.stack(kept_n).astype(np.int64)
+    print(f"  pool queries rejected for an ambiguous top-{HN_TIE_K}: {rejected} of {start}", file=sys.stderr)
+    stats["ambiguous_rejected"] = np.int64(rejected)
+    stats["pool_examined"] = np.int64(start)
+
+    np.savez(meta_path, test=test, neighbors=neighbors, **stats)
+    return Dataset(full_name, train, test, neighbors, metric)
+
+
+def _hn_prepare() -> None:
+    """Build <HN_NAME>_train.npy, _pool.npy, _ids.npy and _prep.npz (see _load_hackernews)."""
+    train_path = DATA_DIR / f"{HN_NAME}_train.npy"
+    pool_path = DATA_DIR / f"{HN_NAME}_pool.npy"
+    prep_path = DATA_DIR / f"{HN_NAME}_prep.npz"
+    if train_path.exists() and pool_path.exists() and prep_path.exists():
+        return
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    parquet = DATA_DIR / "hackernews_part_1_of_1.parquet"
+    if not parquet.exists():
+        _download_resumable(HN_URL, parquet)
+
+    pf = pq.ParquetFile(parquet)
+    n = pf.metadata.num_rows
+    ids = pf.read(columns=["id"]).column("id").to_numpy()
+    if len(np.unique(ids)) != n:
+        raise ValueError(f"{parquet.name}: the id column is not unique")
+
+    # 1. Vectors in file order into a scratch file, hashing each row on the way.
+    raw_path = DATA_DIR / f"{HN_NAME}_raw.tmp.npy"
+    raw = open_memmap(raw_path, mode="w+", dtype=np.float32, shape=(n, HN_DIM))
+    hashes = np.empty(n, dtype=np.uint64)
+    pos = 0
+    print(f"converting {n} vectors from {parquet.name} ...", file=sys.stderr)
+    for g in range(pf.metadata.num_row_groups):
+        col = pf.read_row_group(g, columns=["vector"]).column("vector").combine_chunks()
+        if pc.min(pc.list_value_length(col)).as_py() != HN_DIM or pc.max(pc.list_value_length(col)).as_py() != HN_DIM:
+            raise ValueError(f"{parquet.name}: row group {g} has vectors that are not {HN_DIM}-d")
+        block = col.flatten().to_numpy().reshape(-1, HN_DIM)
+        raw[pos : pos + len(block)] = block
+        hashes[pos : pos + len(block)] = _row_hashes(block)
+        pos += len(block)
+        print(f"\r  {pos * 100 / n:5.1f}%", end="", file=sys.stderr)
+    print(file=sys.stderr)
+    if pos != n:
+        raise ValueError(f"{parquet.name}: read {pos} vectors, metadata says {n}")
+    raw.flush()
+
+    # 2. id order; first occurrence of each distinct vector in that order.
+    order = np.argsort(ids, kind="stable")
+    _, first, inverse = np.unique(hashes[order], return_index=True, return_inverse=True)
+    rep = first[inverse]  # position (in id order) of the row each row duplicates
+    dup_pos = np.nonzero(rep != np.arange(n))[0]
+    # A 64-bit hash collision between distinct vectors is ~1e-5 likely at this
+    # size; check every dropped row byte for byte against the one it duplicates.
+    for s in range(0, len(dup_pos), GEN_CHUNK):
+        p = dup_pos[s : s + GEN_CHUNK]
+        if not np.array_equal(raw[order[p]], raw[order[rep[p]]]):
+            raise ValueError("hash collision between distinct vectors; change the hash keys")
+    keep = np.sort(first)
+    print(f"  exact duplicate vectors dropped: {len(dup_pos)} of {n}", file=sys.stderr)
+
+    # 3. Hold out the query pool; the rest is the base, in id order.
+    rng = np.random.default_rng(HN_SEED)
+    pool_pos = rng.choice(len(keep), HN_HOLDOUT, replace=False)
+    is_base = np.ones(len(keep), dtype=bool)
+    is_base[pool_pos] = False
+    base_src = order[keep[is_base]]
+    pool_src = order[keep[pool_pos]]
+
+    tmp = train_path.with_suffix(".tmp.npy")
+    out = open_memmap(tmp, mode="w+", dtype=np.float32, shape=(len(base_src), HN_DIM))
+    for s in range(0, len(base_src), GEN_CHUNK):
+        out[s : s + GEN_CHUNK] = raw[base_src[s : s + GEN_CHUNK]]
+    out.flush()
+    del out
+    pool = np.ascontiguousarray(raw[pool_src])
+    _assert_unit_norm(np.load(tmp, mmap_mode="r"), "hackernews base vectors")
+    _assert_unit_norm(pool, "hackernews queries")
+
+    np.save(DATA_DIR / f"{HN_NAME}_ids.npy", ids[base_src])
+    np.save(DATA_DIR / f"{HN_NAME}_pool_ids.npy", ids[pool_src])
+    np.save(pool_path, pool)
+    np.savez(prep_path, source_rows=np.int64(n), duplicates_dropped=np.int64(len(dup_pos)),
+             holdout=np.int64(HN_HOLDOUT), holdout_seed=np.int64(HN_SEED),
+             base_rows=np.int64(len(base_src)))
+    tmp.rename(train_path)
+    del raw
+    raw_path.unlink()
+    print(f"  base {len(base_src)} vectors, query pool {HN_HOLDOUT}", file=sys.stderr)
+
+
+def _hn_subset(size: int, dest: Path) -> None:
+    """A seeded random `size`-row subset of the full base, in base order."""
+    full = np.load(DATA_DIR / f"{HN_NAME}_train.npy", mmap_mode="r")
+    if size > len(full):
+        raise ValueError(f"hackernews has {len(full)} base vectors, asked for {size}")
+    idx = np.sort(np.random.default_rng(HN_SEED + size).choice(len(full), size, replace=False))
+    tmp = dest.with_suffix(".tmp.npy")
+    out = open_memmap(tmp, mode="w+", dtype=np.float32, shape=(size, full.shape[1]))
+    for s in range(0, size, GEN_CHUNK):
+        out[s : s + GEN_CHUNK] = full[idx[s : s + GEN_CHUNK]]
+    out.flush()
+    del out
+    tmp.rename(dest)
+
+
+# Fixed odd multipliers for _row_hashes, one per 8-byte word of a row.
+_HASH_KEYS = np.random.default_rng(0x5EED).integers(1, 2**63, size=HN_DIM // 2, dtype=np.uint64) | np.uint64(1)
+
+
+def _row_hashes(x: np.ndarray) -> np.ndarray:
+    """A 64-bit hash of each row's bytes (equal rows -> equal hashes)."""
+    u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint64)
+    mixed = u ^ (u >> np.uint64(29))
+    mixed *= _HASH_KEYS[: u.shape[1]]  # wraps mod 2^64
+    return mixed.sum(axis=1, dtype=np.uint64)
+
+
+def _download_resumable(url: str, dest: Path) -> None:
+    """curl with resume and retries, then check the size against the server's."""
+    import subprocess
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    head = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "vectordb-experiments-bench"})
+    with urllib.request.urlopen(head) as resp:
+        total = int(resp.headers["Content-Length"])
+    print(f"downloading {url} ({total / 1e9:.1f} GB)", file=sys.stderr)
+    subprocess.run(["curl", "-fL", "--retry", "20", "--retry-all-errors", "--retry-delay", "10",
+                    "-C", "-", "-sS", "-o", str(tmp), url], check=True)
+    if tmp.stat().st_size != total:
+        raise ValueError(f"{tmp}: {tmp.stat().st_size} bytes, server says {total}; re-run to resume")
+    tmp.rename(dest)
 
 
 # --- ann-benchmarks ----------------------------------------------------------

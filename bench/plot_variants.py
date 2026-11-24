@@ -120,7 +120,7 @@ DBPEDIA_SERIES = [
      "slot": 1, "match": pg_arm("stock")},
     {"name": "PRISM (pg_vectorsearch)", "short": "PRISM", "index": "prism", "agg": "mean",
      "slot": 2, "match": prism_rows},
-    {"name": "Ginger (PCA, 4+8-bit TQ)", "short": "Ginger", "index": None,
+    {"name": "Ginger, recommended config", "short": "Ginger", "index": None,
      "agg": "mean", "slot": 3, "match": ginger("recommended")},
     {"name": "pgvectorfast HNSW", "short": "pgvectorfast", "index": "hnsw", "agg": "mean",
      "slot": 4, "match": pg_arm("fast")},
@@ -130,10 +130,96 @@ DBPEDIA_SERIES = [
 DBPEDIA_NOTE = ("m510, Xeon D-1548 @ 2.0 GHz pinned, AVX2. Ginger in-process. Postgres client local at 1 "
                 "client, on a 2nd node over 10 GbE from 8 up. Rounds averaged.")
 
+# Hacker News on the c220g2 pair: the same Postgres protocol (1 client local,
+# 10/20/40 from the other node), but the hosts are not named node-*, so the
+# 1-client rows are picked by a local server connection instead.
+def hn_pg_arm(arm, local="pvf", lan="sc"):
+    """1-client rounds (<local>-<arm>-r<n>, client on the server node) and LAN
+    rows (<lan>-<arm>). The huge-pages re-run uses local=hp, lan=hpsc."""
+    return lambda r: (
+        (r["clients"] == 1 and is_label(f"{local}-{arm}-r")(r) and r.get("server_host") in ("localhost", "127.0.0.1"))
+        or (r["clients"] >= 8 and r.get("label") == f"{lan}-{arm}"))
+
+
+HN_SERIES = [
+    {"name": "pgvector 0.8.7 HNSW", "short": "pgvector 0.8.7", "index": "hnsw", "agg": "mean",
+     "slot": 1, "match": hn_pg_arm("stock")},
+    {"name": "Ginger, recommended config", "short": "Ginger", "index": None,
+     "agg": "mean", "slot": 3, "match": ginger("recommended")},
+    {"name": "pgvectorfast HNSW", "short": "pgvectorfast", "index": "hnsw", "agg": "mean",
+     "slot": 4, "match": hn_pg_arm("fast")},
+    {"name": "Ginger, float rerank", "short": "Ginger float-rerank", "index": None,
+     "agg": "mean", "slot": 3, "dash": True, "match": ginger("float-rerank")},
+    {"name": "pgvector_ntq HNSW (tq4 + ntq12)", "short": "pgvector_ntq tq4", "index": "hnsw",
+     "agg": "mean", "slot": 2, "match": hn_pg_arm("ntq")},
+    {"name": "pgvector 0.8.7 HNSW, huge pages", "short": "pgvector, huge pages", "index": "hnsw",
+     "agg": "mean", "slot": 5, "match": hn_pg_arm("stock", "hp", "hpsc")},
+    {"name": "pgvectorfast + tq4 (ntq12)", "short": "pgvectorfast+tq4", "index": "hnsw",
+     "agg": "mean", "slot": 6, "match": hn_pg_arm("fastntq")},
+    {"name": "pgvectorfast + tq4, optimized kernels", "short": "+tq4, fast kernels", "index": "hnsw",
+     "agg": "mean", "slot": 7, "match": hn_pg_arm("fastntq", "pvfk2", "sck2")},
+    {"name": "pgvectorfast + tq4, optimized kernels, huge pages", "short": "+tq4, kernels, huge pages",
+     "index": "hnsw", "agg": "mean", "slot": 8, "match": hn_pg_arm("fastntq", "hpk2", "hpsck2")},
+    # All eight colour slots are taken, so float pgvectorfast on huge pages is
+    # pgvectorfast's colour, dashed (as Ginger float-rerank is Ginger's).
+    {"name": "pgvectorfast HNSW, huge pages", "short": "pgvectorfast, huge pages", "index": "hnsw",
+     "agg": "mean", "slot": 4, "dash": True, "match": hn_pg_arm("fast", "hp", "hpsc")},
+]
+HN_NOTE = ("c220g2, 2x Xeon E5-2660 v3 @ 2.6 GHz pinned, AVX2, memory interleaved over both sockets. "
+           "Ginger in-process. Postgres client local at 1 client, on a 2nd node over 10 GbE from 10 up.")
+HN_TITLE = "Hacker News (MiniLM, 384-d), {n} variants"
+
+# The four-way view (bench/cloudlab/hn_fourway.py has the same source rule):
+# each engine on the HNSW graph (solid) and on Ginger's PiPNN graph imported
+# by the pgvectorfast fork (dashed, same hue), and Ginger. All Postgres rows
+# have the client on the other node, at 1 client too, as the PiPNN arms do;
+# pgvectorfast is the fork's .so where it was run (1, 40) and upstream's at
+# 10 and 20.
+def label_at(by_clients):
+    """Match rows whose label is the one given for their client count."""
+    return lambda r: r.get("label") is not None and r.get("label") == by_clients.get(r["clients"])
+
+
+def _fourway(pgv, pgv_pip, pvf, pvf_pip, ginger_cfg):
+    return [
+        {"name": "pgvector 0.8.7, HNSW graph", "short": "pgvector", "index": "hnsw", "agg": "mean",
+         "slot": 1, "match": label_at(pgv)},
+        {"name": "pgvector 0.8.7, PiPNN graph", "short": "pgvector + PiPNN", "index": "hnsw",
+         "agg": "mean", "slot": 1, "dash": True, "match": label_at(pgv_pip)},
+        {"name": "Ginger, recommended config", "short": "Ginger", "index": None, "agg": "mean",
+         "slot": 3, "match": ginger(ginger_cfg)},
+        {"name": "pgvectorfast, HNSW graph", "short": "pgvectorfast", "index": "hnsw", "agg": "mean",
+         "slot": 4, "match": label_at(pvf)},
+        {"name": "pgvectorfast, PiPNN graph", "short": "pgvectorfast + PiPNN", "index": "hnsw",
+         "agg": "mean", "slot": 4, "dash": True, "match": label_at(pvf_pip)},
+    ]
+
+
+HN4_SERIES = _fourway({1: "pipstock-hnsw", 10: "sc-stock", 20: "sc-stock", 40: "sc-stock"},
+                      {1: "pipstock-pipnn", 40: "pipstock-pipnn"},
+                      {1: "piphnsw-fork", 10: "sc-fast", 20: "sc-fast", 40: "piphnsw-fork"},
+                      {1: "pippipnn-fork", 40: "pippipnn-fork"}, "recommended")
+HN4_HP_SERIES = _fourway({1: "piphp-hnsw-stock", 10: "hpsc-stock", 20: "hpsc-stock", 40: "hpsc-stock"},
+                         {1: "piphp-pipnn-stock", 40: "piphp-pipnn-stock"},
+                         {1: "piphp-hnsw-fork", 40: "piphp-hnsw-fork"},
+                         {1: "piphp-pipnn-fork", 40: "piphp-pipnn-fork"}, "thp-recommended")
+HN4_NOTE = ("c220g2, 2x E5-2660 v3 @ 2.6 GHz pinned, AVX2. Postgres on 4 KB pages, client on a 2nd node. "
+            "Dashed: Ginger's PiPNN graph imported into an hnsw index.")
+HN4_HP_NOTE = ("c220g2, 2x E5-2660 v3 @ 2.6 GHz pinned, AVX2. 2 MB pages: Postgres huge_pages=on, Ginger THP "
+               "(jemalloc thp:always). Client on a 2nd node. Dashed: PiPNN graph in an hnsw index.")
+HN4_TITLE = "Hacker News 27.4M, HNSW vs PiPNN graph ({n} series)"
+
 BIGANN_TITLE = "18M BIGANN (SIFT), {n} index variants"
 DBPEDIA_TITLE = "DBpedia OpenAI 1M (ada-002, 1536-d), {n} variants"
+SIFT_TITLE = "SIFT1M (128-d), {n} variants"
+SIFT_NOTE = ("m510, Xeon D-1548 @ 2.0 GHz pinned, AVX2. Ginger in-process. Postgres client local at 1 "
+             "client, on a 2nd node over 10 GbE from 8 up. Frame-pointer build.")
 SERIES_SETS = {"bigann": (SERIES, BIGANN_NOTE, BIGANN_TITLE),
-               "dbpedia": (DBPEDIA_SERIES, DBPEDIA_NOTE, DBPEDIA_TITLE)}
+               "dbpedia": (DBPEDIA_SERIES, DBPEDIA_NOTE, DBPEDIA_TITLE),
+               "sift": (DBPEDIA_SERIES, SIFT_NOTE, SIFT_TITLE),
+               "hackernews": (HN_SERIES, HN_NOTE, HN_TITLE),
+               "hackernews-fourway": (HN4_SERIES, HN4_NOTE, HN4_TITLE),
+               "hackernews-fourway-hp": (HN4_HP_SERIES, HN4_HP_NOTE, HN4_TITLE)}
 
 W, H = 1000, 660
 PAD = {"l": 78, "r": 200, "t": 128, "b": 106}
@@ -334,7 +420,8 @@ def main():
                     help="which variant set to draw (default: bigann for bigann_* datasets, "
                          "dbpedia otherwise)")
     args = ap.parse_args()
-    spec, note, title = SERIES_SETS[args.series or ("bigann" if args.dataset.startswith("bigann") else "dbpedia")]
+    default = next((k for k in ("bigann", "sift", "hackernews") if args.dataset.startswith(k)), "dbpedia")
+    spec, note, title = SERIES_SETS[args.series or default]
     series, dropped = load(args.dataset, args.clients, spec)
     if not series:
         sys.exit(f"no sweeps for {args.dataset} with clients={args.clients}")
