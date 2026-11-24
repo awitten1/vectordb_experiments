@@ -14,3 +14,12 @@
 [submodule "ginger"]
 	path = ginger
 	url = https://github.com/awitten1/ginger.git
+[submodule "pgvector_ntq"]
+	path = pgvector_ntq
+	url = https://github.com/awitten1/pgvector
+[submodule "pgvectorfast_pipnn"]
+	path = pgvectorfast_pipnn
+	url = https://github.com/awitten1/pgvectorfast.git
+[submodule "pgvectorfast_ntq"]
+	path = pgvectorfast_ntq
+	url = https://github.com/awitten1/pgvectorfast.git
