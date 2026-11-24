@@ -29,12 +29,19 @@ def main() -> None:
     p.add_argument("--ef", default="40,640")
     p.add_argument("--n", type=int, default=100)
     p.add_argument("--k", type=int, default=10)
+    p.add_argument("--index", choices=["hnsw", "hnsw_halfvec"], default="hnsw",
+                   help="hnsw_halfvec: the query ann_bench.py sends to the halfvec expression index")
+    p.add_argument("--table", help="table to query (default: the dataset's own)")
     p.add_argument("--dsn", default="host=localhost port=5433 user=postgres dbname=postgres")
     args = p.parse_args()
 
     ds = datasets.load(args.dataset, num_queries=args.n + 1)
-    sql = (f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM {ds.table} "
-           f"ORDER BY embedding {ds.operator} %s LIMIT {args.k}")
+    if args.index == "hnsw_halfvec":
+        order = f"embedding::halfvec({ds.dim}) {ds.operator} %s::halfvec({ds.dim})"
+    else:
+        order = f"embedding {ds.operator} %s"
+    table = args.table or ds.table
+    sql = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM {table} ORDER BY {order} LIMIT {args.k}"
     with psycopg.connect(args.dsn, autocommit=True) as conn:
         register_vector(conn)
         conn.execute("SET enable_seqscan = off")
