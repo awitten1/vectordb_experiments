@@ -1,0 +1,199 @@
+{
+ "_about": "Stock pgvector 0.8.7 HNSW (m=16, ef_construction=64) on SIFT1M (sift-128-euclidean), CloudLab m510 node-0, clock pinned at 2.0 GHz, frame-pointer build, client on node-1. Same method as dbpedia-pgvector-bottlenecks.json: perf_window.sh during profile_pgvector.sh (TAG=sift, EFS='40 160', FAST_EF=160). busy_cpus and server CPU per query come from call-graph samples in Postgres processes (perf_summary.py). Transcribed from the tools' output: the raw perf files were lost when the experiment's nodes were reclaimed.",
+ "recall": {
+  "40": 0.926,
+  "160": 0.9927
+ },
+ "counters": [
+  {
+   "engine": "pgvector",
+   "clients": 1,
+   "ef_search": 40,
+   "qps": 409,
+   "busy_cpus": 1.0,
+   "ipc": 0.89,
+   "dram_read_gbps": 0.5,
+   "dram_mb_per_query": 1.13,
+   "server_cpu_ms_per_query": 2.32,
+   "topdown_pct": {
+    "retiring": 28,
+    "frontend": 17,
+    "bad_speculation": 5,
+    "backend": 49,
+    "memory_bound": 36,
+    "core_bound": 14
+   }
+  },
+  {
+   "engine": "pgvector",
+   "clients": 1,
+   "ef_search": 160,
+   "qps": 172,
+   "busy_cpus": 1.0,
+   "ipc": 0.91,
+   "dram_read_gbps": 0.5,
+   "dram_mb_per_query": 2.75,
+   "server_cpu_ms_per_query": 5.62,
+   "topdown_pct": {
+    "retiring": 26,
+    "frontend": 12,
+    "bad_speculation": 6,
+    "backend": 56,
+    "memory_bound": 37,
+    "core_bound": 20
+   }
+  },
+  {
+   "engine": "pgvector",
+   "clients": 8,
+   "ef_search": 40,
+   "qps": 3006,
+   "busy_cpus": 7.4,
+   "ipc": 0.92,
+   "dram_read_gbps": 3.5,
+   "dram_mb_per_query": 1.16,
+   "server_cpu_ms_per_query": 2.47,
+   "topdown_pct": {
+    "retiring": 26,
+    "frontend": 13,
+    "bad_speculation": 5,
+    "backend": 56,
+    "memory_bound": 40,
+    "core_bound": 16
+   }
+  },
+  {
+   "engine": "pgvector",
+   "clients": 8,
+   "ef_search": 160,
+   "qps": 1466,
+   "busy_cpus": 7.7,
+   "ipc": 0.86,
+   "dram_read_gbps": 4.6,
+   "dram_mb_per_query": 3.15,
+   "server_cpu_ms_per_query": 5.23,
+   "topdown_pct": {
+    "retiring": 22,
+    "frontend": 8,
+    "bad_speculation": 5,
+    "backend": 65,
+    "memory_bound": 50,
+    "core_bound": 14
+   }
+  },
+  {
+   "engine": "pgvector",
+   "clients": 16,
+   "ef_search": 40,
+   "qps": 5494,
+   "busy_cpus": 13.7,
+   "ipc": 0.65,
+   "dram_read_gbps": 6.7,
+   "dram_mb_per_query": 1.22,
+   "server_cpu_ms_per_query": 2.5,
+   "topdown_pct": {
+    "retiring": 34,
+    "frontend": 28,
+    "bad_speculation": 4,
+    "backend": 34,
+    "memory_bound": 25,
+    "core_bound": 8
+   }
+  },
+  {
+   "engine": "pgvector",
+   "clients": 16,
+   "ef_search": 160,
+   "qps": 2841,
+   "busy_cpus": 14.9,
+   "ipc": 0.52,
+   "dram_read_gbps": 10.7,
+   "dram_mb_per_query": 3.77,
+   "server_cpu_ms_per_query": 5.23,
+   "topdown_pct": {
+    "retiring": 27,
+    "frontend": 21,
+    "bad_speculation": 4,
+    "backend": 48,
+    "memory_bound": 40,
+    "core_bound": 8
+   }
+  },
+  {
+   "engine": "pgvectorfast",
+   "clients": 8,
+   "ef_search": 160,
+   "qps": 4352,
+   "busy_cpus": 7.2,
+   "ipc": 1.2,
+   "dram_read_gbps": 11.8,
+   "dram_mb_per_query": 2.71,
+   "server_cpu_ms_per_query": 1.66,
+   "topdown_pct": {
+    "retiring": 32,
+    "frontend": 18,
+    "bad_speculation": 14,
+    "backend": 36,
+    "memory_bound": 20,
+    "core_bound": 15
+   }
+  },
+  {
+   "engine": "pgvectorfast",
+   "clients": 16,
+   "ef_search": 160,
+   "qps": 6421,
+   "busy_cpus": 13.4,
+   "ipc": 0.75,
+   "dram_read_gbps": 17.9,
+   "dram_mb_per_query": 2.78,
+   "server_cpu_ms_per_query": 2.08,
+   "topdown_pct": {
+    "retiring": 36,
+    "frontend": 24,
+    "bad_speculation": 11,
+    "backend": 28,
+    "memory_bound": 18,
+    "core_bound": 10
+   }
+  }
+ ],
+ "buffer_accesses_per_query": {
+  "10": 465,
+  "40": 1039,
+  "160": 2984,
+  "640": 8931
+ },
+ "breakdown_share_pct": {
+  "1client_ef160": {
+   "Distance": 9.3,
+   "Buffer manager: page lookup": 21.7,
+   "Buffer manager: pin, locks, refcounts": 24.1,
+   "HNSW element and neighbor loading": 25.2,
+   "Visited set": 5.9,
+   "Candidate queues": 2.7,
+   "Executor, protocol, other": 9.1,
+   "Kernel": 1.5,
+   "Memory allocation": 0.6
+  },
+  "16clients_ef160": {
+   "Distance": 12.4,
+   "Buffer manager: page lookup": 20.3,
+   "Buffer manager: pin, locks, refcounts": 25.2,
+   "HNSW element and neighbor loading": 23.4,
+   "Visited set": 5.3,
+   "Candidate queues": 2.8,
+   "Executor, protocol, other": 7.0,
+   "Kernel": 1.9,
+   "Memory allocation": 0.6
+  },
+  "pgvectorfast_16clients_ef160_note": "pgvectorfast's own functions: HnswLoadUnvisitedRaw 35%, HnswSearchLayerDiskFastCore 34%, HnswGetDistanceOptimistic 13%; buffer manager ~1%."
+ },
+ "page_walks_1client_ef160": {
+  "dtlb_walks_per_visit": 4.2,
+  "cycles_per_walk": 51.5,
+  "estimated_share_of_cpu_pct": 5.7,
+  "measured_walk_cycles_over_cycles_pct": 12.4,
+  "note": "Use the estimate: walks per visited node x cycles per walk (216 cycles = 0.11 us) over the 1.88 us of CPU per node from call-graph samples. The measured ratio divides walk_duration by this run's `cycles` count, which showed ~0.6 busy CPUs for a single busy backend (the undercount seen elsewhere), inflating it. The same cross-check on DBpedia gives 12.4% against a measured 12.7%."
+ }
+}

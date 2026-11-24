@@ -10,6 +10,11 @@ two CloudLab nodes with the scripts in `cloudlab/` (`run_ginger.sh` drives
 Ginger; `qdrant:<name>` datasets load Qdrant's benchmark sets).
 `PGVECTOR-BOTTLENECKS.md` is the profile of what limits pgvector's HNSW on that
 dataset.
+`FINDINGS-hackernews.md` compares pgvector, pgvectorfast, Ginger and pgvector_ntq
+(4-bit TurboQuant HNSW) on Hacker News 28.7M × 384-d, on two CloudLab c220g2
+nodes (`cloudlab/hn_qps.sh`, `cloudlab/hn_tq4.sh`; dataset spec `hackernews`).
+`cloudlab/README.md` explains how the CloudLab experiments run and what each
+script does.
 
 ## Setup
 
