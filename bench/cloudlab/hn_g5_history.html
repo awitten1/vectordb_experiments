@@ -1,0 +1,319 @@
+<article class="paper">
+<header class="paper-head">
+  <h2 class="paper-title">Closing the gap between PostgreSQL and an in-process ANN library: a sequence of experiments</h2>
+  <p class="paper-meta">Hacker News MiniLM embeddings (27.4M × 384), CloudLab c220g5, November 2026</p>
+</header>
+
+<section class="abstract">
+  <h3>Abstract</h3>
+  <p>We measured approximate nearest-neighbour search inside PostgreSQL (pgvector and the pgvectorfast fork) against
+  Ginger, an in-process library, on 27.4 million 384-dimensional vectors. After a baseline across six
+  configurations, we took the fastest PostgreSQL configuration (pgvectorfast searching a PiPNN graph with 4-bit
+  TurboQuant codes, "tq4") and tested a series of changes. We tried each one because the previous measurement
+  pointed to it: larger database pages, a graph-ordered physical layout, a cap on how many candidates are
+  re-ranked, a vectorised re-ranking kernel, more client connections, and removing a per-query heavyweight lock.
+  At recall@10 = 0.95 and full load, PostgreSQL went from 22,383 to 30,150 queries per second (+35%), and Ginger's
+  lead fell from 1.96× to 1.46×. With one client at recall 0.99, PostgreSQL now outperforms Ginger (650 against 594
+  QPS). The remaining gap is mostly the cost of being a client/server database: about 240 µs of CPU per query for
+  receiving, executing and answering an SQL statement. Ginger does not pay this cost.</p>
+</section>
+
+<section>
+  <h3>1&nbsp;&nbsp;Experimental setup</h3>
+  <p>All runs use the same two CloudLab c220g5 nodes:</p>
+  <ul>
+    <li><strong>Hardware:</strong> each node has 2 × Xeon Silver 4114 (20 cores, 40 hardware threads, AVX-512) and
+    192 GB DDR4-2400. The clock is pinned at the 2.2 GHz base frequency, with turbo off.</li>
+    <li><strong>Roles:</strong> one node runs PostgreSQL 18.6. The other runs the benchmark clients, over a
+    dedicated LAN, and Ginger, in-process. Ginger therefore never touches the network.</li>
+    <li><strong>Data:</strong> 27,445,759 MiniLM embeddings of Hacker News comments, queried with 1,000 held-out
+    vectors against exact top-10 ground truth.</li>
+    <li><strong>Measurement:</strong> each point holds one search width (<code>ef_search</code>, or Ginger's beam
+    width) for 60 s, with every relation prewarmed and checked resident in a 112 GB buffer pool backed by 2 MB
+    huge pages.</li>
+    <li><strong>Comparison:</strong> we compare engines at matched recall, interpolating between neighbouring
+    widths linearly in recall and in log QPS.</li>
+    <li><strong>Load:</strong> "full load" means 60 client connections for PostgreSQL and 40 threads for Ginger,
+    unless stated otherwise.</li>
+  </ul>
+  <p>Where a change could be toggled at run time, we measured it against a control in the same server session.
+  Otherwise the control is the preceding run of the same configuration. Repeated runs of one configuration agree
+  within about 2–3%.</p>
+</section>
+
+<section>
+  <h3>2&nbsp;&nbsp;Baseline</h3>
+  <p><em>Why.</em> The study needed one clean comparison on the new machines. There are two graphs, PostgreSQL's
+  own HNSW (m = 32) and a PiPNN graph imported into pgvectorfast's index format, and two engines on each,
+  stock pgvector and pgvectorfast. To these we added pgvectorfast with 4-bit navigation codes, and Ginger.</p>
+  <p><em>Result.</em> Table 1 gives throughput at recall 0.95. The graph matters most: on the same engine, PiPNN is
+  1.6–1.7× faster than HNSW. Quantised codes come next, at 2.6× under load. To see what limits each engine, we
+  divided full-load throughput by single-client throughput.</p>
+  <ul>
+    <li><strong>CPU-bound:</strong> pgvector and tq4 scale 21–22× from one client to sixty, and Ginger 27–29×
+    from one thread to forty. That is what CPU-bound code achieves on 20 cores with hyperthreading.</li>
+    <li><strong>Bandwidth-bound:</strong> pgvectorfast on float vectors scales only about 8×. A bandwidth test on
+    this machine measured 77 GB/s for reads across both sockets (only 6 of 12 memory channels are populated). At
+    full load, float pgvectorfast moves about 19 MB per query, which is consistent with memory bandwidth being
+    the limit.</li>
+  </ul>
+  <div class="tbl"><table>
+    <caption>Table 1. QPS at recall@10 = 0.95, huge pages.</caption>
+    <thead><tr><th scope="col">configuration</th><th scope="col">1 client</th><th scope="col">full load</th><th scope="col">Ginger ahead at full load</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">pgvector, HNSW m = 32</th><td>158</td><td>3,528</td><td>12.5×</td></tr>
+      <tr><th scope="row">pgvectorfast, HNSW m = 32</th><td>600</td><td>5,063</td><td>8.7×</td></tr>
+      <tr><th scope="row">pgvector, PiPNN graph</th><td>264</td><td>6,082</td><td>7.2×</td></tr>
+      <tr><th scope="row">pgvectorfast, PiPNN graph</th><td>960</td><td>8,612</td><td>5.1×</td></tr>
+      <tr><th scope="row">pgvectorfast, PiPNN graph + tq4</th><td>1,045</td><td>22,383</td><td>1.96×</td></tr>
+      <tr><th scope="row">Ginger (1 / 40 threads)</th><td>1,555</td><td>43,972</td><td>–</td></tr>
+    </tbody>
+  </table></div>
+  <p>Everything that follows starts from the tq4 configuration, the fastest PostgreSQL arm. A second pass on 4 KB
+  pages was stopped early as unnecessary.</p>
+</section>
+
+<section>
+  <h3>3&nbsp;&nbsp;32 KB database pages</h3>
+  <p><em>Why.</em> pgvectorfast's buffer manager (Calico) keeps an 8-byte translation entry per index block. At
+  8 KB pages the tq4 index needs about 30 MB of entries, more than the 27.5 MB of last-level cache on both sockets
+  combined. At 32 KB pages it needs about 7 MB. Larger pages also waste less space at the end of each page.</p>
+  <p><em>Method.</em> We built a second PostgreSQL with <code>-Dblocksize=32</code>, loaded the same table, and
+  imported the same PiPNN graph, with each node's row address rewritten for the new table.</p>
+  <p><em>Result.</em></p>
+  <ul>
+    <li><strong>Recall</strong> was identical at all 16 points.</li>
+    <li><strong>One client:</strong> no change (within ±1.5%).</li>
+    <li><strong>Full load:</strong> 7–9% more throughput from ef_search 40 up (22,383 → 24,360 QPS at recall
+    0.95).</li>
+    <li><strong>Size:</strong> the index shrank from 29.5 to 28.2 GiB.</li>
+  </ul>
+  <p>A gain that appears only when every core competes for cache fits the smaller translation table, but this
+  experiment does not isolate it.</p>
+</section>
+
+<section>
+  <h3>4&nbsp;&nbsp;Graph-ordered layout</h3>
+  <p><em>Why.</em> Ginger's recommended configuration renumbers the graph by recursive partitioning, so that
+  neighbours sit close together in memory. PostgreSQL stores index elements in table order. An earlier offline
+  estimate on 8 KB pages, with 4 float elements per page, had found little to gain. A 32 KB page holds about 46 tq4
+  elements, so order could matter more. Simulating the walk predicted 12% fewer distinct pages per node expansion
+  (39.4 against 34.6).</p>
+  <p><em>Method.</em> No code change was needed. The graph import lays the index out in the order it reads the
+  table, so we loaded a copy of the table in the graph's node order. Exporting the reordered graph rebuilt it, and
+  PiPNN's construction is not deterministic: the new graph shares 96.2% of its edges with the old one.</p>
+  <p><em>Result.</em></p>
+  <ul>
+    <li><strong>Recall</strong> differed by at most 0.0016 from ef_search 40 up.</li>
+    <li><strong>Full load,</strong> at matched recall: 6–10% more throughput (24,360 → 25,906 QPS at 0.95).</li>
+    <li><strong>One client:</strong> 1–5% more.</li>
+  </ul>
+  <p>Together with 32 KB pages, full-load throughput at recall 0.95 is up 16% on the baseline. Because the graph was
+  rebuilt, part of this gain could come from the graph rather than the layout.</p>
+</section>
+
+<section>
+  <h3>5&nbsp;&nbsp;Where the remaining time goes</h3>
+  <p><em>Why.</em> Ginger was still 1.70× faster at recall 0.95 under full load. Before changing anything else, we
+  wanted to know where each engine's time goes.</p>
+  <p><em>Method.</em> We profiled both engines at width 64, where both reach recall 0.952 and do the same work per
+  query (72.9 against 72.8 nodes expanded, 2,501 against 2,492 distances). We collected hardware counters, call
+  stacks sampled at a fixed cycle interval, memory-controller bandwidth, and cross-core cache-line contention. We
+  also ran PostgreSQL without the network: a single SQL statement answering 100 queries, so that the cost of the
+  search could be separated from the cost of the statement around it.</p>
+  <p><em>Result</em> (Table 2): three effects account for the gap.</p>
+  <ul>
+    <li><strong>Re-ranking.</strong> PostgreSQL re-scores every one of the ef_search candidates with 12-bit codes,
+    using a scalar loop that takes 4.0 µs per candidate. Ginger re-scores at most 60, at 0.32 µs each.</li>
+    <li><strong>The statement path.</strong> Receiving, executing and answering each SQL statement costs about
+    240 µs of CPU per query at full load.</li>
+    <li><strong>Memory traffic under load.</strong> On one thread, PostgreSQL's graph walk is actually faster
+    than Ginger's, because it prefetches every neighbour. But it moves 2.7× more DRAM bytes per query, and loses
+    most of that lead under load.</li>
+  </ul>
+  <p>Cache-line contention between cores was negligible, at about 10 µs per query.</p>
+  <div class="tbl"><table>
+    <caption>Table 2. CPU µs per query at width 64 (recall 0.952), full load.</caption>
+    <thead><tr><th scope="col">component</th><th scope="col">Ginger</th><th scope="col">PostgreSQL</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">re-rank</th><td>30</td><td>382</td></tr>
+      <tr><th scope="row">graph traversal (4-bit distances, neighbour lists)</th><td>855</td><td>750</td></tr>
+      <tr><th scope="row">query encoding</th><td>12</td><td>15</td></tr>
+      <tr><th scope="row">statement path (protocol, executor, kernel)</th><td>20</td><td>258</td></tr>
+      <tr class="tot"><th scope="row">total</th><td>917</td><td>1,405</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h3>6&nbsp;&nbsp;Capping the re-rank at 10 × k</h3>
+  <p><em>Why.</em> The number of re-scored candidates grows with ef_search in PostgreSQL but is fixed in Ginger. A
+  cap is the simplest change. It needs no index rebuild, only a new setting.</p>
+  <p><em>Method.</em> We added a setting, <code>hnsw.rerank_limit</code>, and set it to 100 (10 × k): only the
+  100 candidates nearest by 4-bit distance are re-scored, and the rest keep their 4-bit order.</p>
+  <p><em>Result.</em></p>
+  <ul>
+    <li><strong>Recall</strong> was identical at every width. The true top 10 always ranked within the top 100.</li>
+    <li><strong>Throughput</strong> rose only where the cap binds, from ef_search 160 up: by 8–28% at full load
+    and 15–75% with one client.</li>
+    <li><strong>At recall 0.95</strong> (ef_search ≈ 64) there are fewer than 100 candidates, so the cap changes
+    nothing.</li>
+  </ul>
+  <p>The count of re-scored candidates was therefore a problem only at high recall. At recall 0.95 the cost lay in the
+  time per candidate.</p>
+</section>
+
+<section>
+  <h3>7&nbsp;&nbsp;A vectorised re-ranking kernel</h3>
+  <p><em>Why.</em> The scalar kernel was 12× slower per candidate than Ginger's. With 8 extra bits, each
+  dimension's sub-code is a whole byte, and the 8 KB codebook fits in L1 cache. The computation therefore maps
+  directly onto SIMD gathers.</p>
+  <p><em>Method.</em> We wrote AVX-512 and AVX2 versions, selected at run time by
+  <code>hnsw.rerank_kernel</code>, and checked them against the scalar loop in 3,200 comparisons. They agree up to
+  floating-point summation order. In a micro-benchmark, a distance takes 3,437 ns with the scalar loop, 743 ns
+  with AVX2 and 401 ns with AVX-512.</p>
+  <p><em>Result.</em> Recall was identical at every width.</p>
+  <ul>
+    <li><strong>One client:</strong> throughput rose as the profile predicted: +32% at recall 0.95 and +23% at
+    0.99. At 0.99, PostgreSQL overtook Ginger (650 against 594 QPS).</li>
+    <li><strong>Full load:</strong> the gain was only 8–9%, against about 30% predicted, and at ef_search 10
+    throughput fell by 9%, although only 10 candidates are re-scored there.</li>
+    <li><strong>The kernels compared in one session:</strong> at full load, AVX2 matched or beat AVX-512.</li>
+  </ul>
+  <p>Skylake-SP processors lower a core's clock while it executes wide floating-point vector instructions, and that
+  would slow the rest of each query. That would explain the results, but we have not measured the clock, so it
+  remains a hypothesis.</p>
+</section>
+
+<section>
+  <h3>8&nbsp;&nbsp;Low recall: more clients</h3>
+  <p><em>Why.</em> Ginger's lead was largest at low recall: 2.9× at ef_search 10, against 1.4× at 160. At those
+  widths the server was only 60–85% busy with 60 clients, which suggested the clients could not supply enough
+  work.</p>
+  <p><em>Result.</em> With 90 clients, throughput changed by between −4% and +7%, the server remained 66–90% busy,
+  and tail latency nearly doubled. Supplying more work did not help.</p>
+</section>
+
+<section>
+  <h3>9&nbsp;&nbsp;Diagnosing the idle server</h3>
+  <p><em>Why.</em> If more clients do not fill the server, queries must be waiting somewhere that uses no CPU.</p>
+  <p><em>Method.</em> During the low-recall runs we sampled, on both nodes:</p>
+  <ul>
+    <li>the load on each individual CPU;</li>
+    <li>where the network card's interrupts land;</li>
+    <li>packet-processing drops;</li>
+    <li>what each PostgreSQL backend is waiting on, every 100 ms.</li>
+  </ul>
+  <p>A no-search query, with the same message and parameter, measured what the client/server path alone can
+  carry.</p>
+  <p><em>Result.</em> Two causes, and one non-cause.</p>
+  <ul>
+    <li><strong>One socket did all the work.</strong> The network card is attached to socket 0, and its
+    interrupts are pinned there. Each query's packet wakes its backend from that socket, and the scheduler keeps
+    the backend there. At ef_search 10, socket 0 was 19–20 of 20 hardware threads busy, and socket 1 only 3–8.</li>
+    <li><strong>Every query took the same heavyweight lock.</strong> The scan takes a shared page lock twice per
+    query, so that VACUUM can wait for in-flight scans. Shared locks do not conflict with one another. But a page
+    lock cannot use PostgreSQL's per-backend fast path, so each acquisition and release is an exclusive pass
+    through the same partition of the shared lock table. Backends were waiting on that partition in 21% of samples
+    at 60 clients and 46% at 90.</li>
+    <li><strong>The network was not the limit.</strong> The no-search query reached 144,000 QPS at 60 clients and
+    179,000 at 90, with no packet drops.</li>
+  </ul>
+</section>
+
+<section>
+  <h3>10&nbsp;&nbsp;Removing the scan lock</h3>
+  <p><em>Why.</em> To measure the lock's cost directly.</p>
+  <p><em>Method.</em> A superuser setting, <code>hnsw.scan_lock</code>, skips the lock. It is not safe in
+  production, since a concurrent VACUUM could then free index elements a scan is reading, so it serves here only
+  as a measurement. We compared it against a control with the lock, in the same server session.</p>
+  <p><em>Result</em> (Table 3). Neither change helped on its own:</p>
+  <ul>
+    <li><strong>Lock off, 60 clients:</strong> no gain. The lock waits disappeared, but socket 0 stayed saturated.</li>
+    <li><strong>Lock on, 90 clients:</strong> no gain. The extra backends queued on the lock.</li>
+    <li><strong>Lock off, 90 clients:</strong> enough runnable backends to spread onto socket 1. The server was
+    99–100% busy at every width, throughput rose 39% at ef_search 10, and Ginger's lead there fell from 2.9× to
+    1.98×.</li>
+    <li><strong>High recall:</strong> from ef_search 320 up, 60 clients already keep the server busy. There, 90 clients
+    without the lock were 2–6% slower (9,064 against 9,269 QPS at ef_search 320): 90 backends on 40 hardware
+    threads only add switching. At recall 0.99 the two give the same throughput (11,991 against 12,018).</li>
+  </ul>
+  <div class="tbl"><table>
+    <caption>Table 3. QPS at full load, with server CPU busy, for the vectorised re-ranking build.</caption>
+    <thead><tr><th scope="col">ef_search (recall)</th><th scope="col">Ginger, 40 threads</th><th scope="col">60 clients, lock</th><th scope="col">90 clients, lock</th><th scope="col">90 clients, no lock</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">10 (0.72)</th><td>147,169</td><td>50,782 (60%)</td><td>53,441 (66%)</td><td>74,495 (99%)</td></tr>
+      <tr><th scope="row">20 (0.85)</th><td>99,124</td><td>45,215 (69%)</td><td>44,767 (70%)</td><td>58,464 (99%)</td></tr>
+      <tr><th scope="row">40 (0.92)</th><td>61,724</td><td>36,677 (82%)</td><td>34,743 (79%)</td><td>41,132 (100%)</td></tr>
+      <tr><th scope="row">80 (0.96)</th><td>37,021</td><td>25,017 (93%)</td><td>23,940 (90%)</td><td>26,259 (100%)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h3>11&nbsp;&nbsp;What remains: the statement path</h3>
+  <p>Once the server is fully busy, the remaining gap is CPU time per query: 537 µs against Ginger's 272 at
+  ef_search 10. Most of the difference is the statement path. For each query, PostgreSQL:</p>
+  <ol>
+    <li>receives a TCP message and wakes a backend process;</li>
+    <li>decodes the 1.5 KB vector parameter;</li>
+    <li>starts a transaction and takes a snapshot;</li>
+    <li>looks up the cached plan and catalog entries;</li>
+    <li>sets up an executor in fresh memory contexts;</li>
+    <li>fetches the ten result rows;</li>
+    <li>commits;</li>
+    <li>sends the reply back through the kernel.</li>
+  </ol>
+  <p>This costs 137 µs of CPU per query with one client and 258 µs at full load, against 41–78 µs when 100
+  queries share one statement. Ginger pays none of it.</p>
+  <p>The overhead is fixed per query, so its weight depends on the cost of the search. It nearly doubles the cost
+  of a cheap low-recall query, but adds only about 10% at high recall. This is why the gap between the engines
+  narrows as recall rises.</p>
+  <div class="tbl"><table>
+    <caption>Table 4. Recall 0.95, full load: the starting point against the best result.</caption>
+    <thead><tr><th scope="col">configuration</th><th scope="col">QPS</th><th scope="col">Ginger ahead</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">PiPNN + tq4, 8 KB pages (baseline)</th><td>22,383</td><td>1.96×</td></tr>
+      <tr><th scope="row">+ 32 KB pages</th><td>24,360</td><td>1.81×</td></tr>
+      <tr><th scope="row">+ graph-ordered layout</th><td>25,906</td><td>1.70×</td></tr>
+      <tr><th scope="row">+ re-rank cap (no effect at 0.95)</th><td>25,809</td><td>1.70×</td></tr>
+      <tr><th scope="row">+ vectorised re-rank kernel</th><td>28,010</td><td>1.57×</td></tr>
+      <tr><th scope="row">+ no scan lock, 90 clients</th><td>30,150</td><td>1.46×</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h3>12&nbsp;&nbsp;Threats to validity</h3>
+  <ul>
+    <li><strong>Single runs:</strong> each configuration was measured once per point. Differences under about 3%
+    are within run-to-run variation.</li>
+    <li><strong>Graph rebuild:</strong> the graph-ordered layout came with a rebuilt graph, so the layout's
+    contribution is not isolated.</li>
+    <li><strong>Different nodes:</strong> Ginger ran on the client node and PostgreSQL on the server node. They
+    are identical machines, but not the same one.</li>
+    <li><strong>The scan lock:</strong> the no-lock result is an upper bound on what a safe replacement could
+    achieve.</li>
+    <li><strong>The clock hypothesis:</strong> the frequency explanation for the vectorised kernel's behaviour
+    under load is untested.</li>
+    <li><strong>Profile attribution:</strong> the profiles attribute index time by function name, because the
+    extension is built without frame pointers.</li>
+  </ul>
+</section>
+
+<section>
+  <h3>13&nbsp;&nbsp;Next steps</h3>
+  <ol>
+    <li><strong>Replace the scan lock safely:</strong> a lightweight lock held in shared mode, or a scan counter
+    that VACUUM waits on.</li>
+    <li><strong>Use both sockets:</strong> spread the network card's interrupts over both sockets, so that the
+    whole server is used without extra clients.</li>
+    <li><strong>Test the clock hypothesis:</strong> measure core frequency under each re-ranking kernel. If it
+    holds, write an all-integer kernel.</li>
+    <li><strong>Reduce memory traffic:</strong> shrink the index element so that each neighbour visit moves fewer
+    bytes, for example by moving heap row pointers out of the element.</li>
+    <li><strong>Amortise the statement path:</strong> answer several queries per statement or round trip. This
+    changes how an application issues queries, not the engine.</li>
+  </ol>
+</section>
+</article>
