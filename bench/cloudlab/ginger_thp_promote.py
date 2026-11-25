@@ -2,7 +2,7 @@
 """Check that a Ginger run really used (or really didn't use) transparent huge
 pages, then append its rows to the results file under a new label.
 
-  ginger_thp_promote.py <rows.jsonl> <sampler.csv> <label> <thp|4k>
+  ginger_thp_promote.py <rows.jsonl> <sampler.csv> <label> <thp|4k> [results.jsonl]
 
 <sampler.csv> holds samples of the ginger_bench process's smaps_rollup
 (t, rss_kb, anon_kb, anon_huge_kb), written by hn_ginger_thp.sh while the run
@@ -17,6 +17,8 @@ import sys
 RESULTS = "bench/results/hackernews_minilm_384.jsonl"
 
 rows_path, sampler_path, label, mode = sys.argv[1:5]
+if len(sys.argv) > 5:
+    RESULTS = sys.argv[5]
 with open(sampler_path) as f:
     samples = [{k: int(v) for k, v in r.items()} for r in csv.DictReader(f)]
 if len(samples) < 3:

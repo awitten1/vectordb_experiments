@@ -843,7 +843,10 @@ phase_build_tq() {
 # table (PIPNN_TABLE). FAST_SO must be a pgvectorfast with hnsw.build_graph_file
 # (the awitten1/pgvectorfast fork); PIPNN_BIN is its tools/pipnn_export.
 #   1. load PIPNN_TABLE with ann_bench's row encoder (same ids and rows as the
-#      dataset's table), as an UNLOGGED table: neither the 42 GB load nor the
+#      dataset's table; PIPNN_ORDER=<file.npy> of row ids loads them in that
+#      order, e.g. a graph's node order, which the import below then lays the
+#      index out in; PIPNN_TABLESPACE puts the table in that tablespace), as an
+#      UNLOGGED table: neither the 42 GB load nor the
 #      index build writes WAL, which /mydata has no room for. Reads are the same;
 #      Postgres empties an unlogged table and its index after a crash or an
 #      immediate shutdown (a clean stop keeps them).
@@ -885,8 +888,10 @@ phase_build_pipnn() {
   say "loading $PIPNN_TABLE ($DATASET), unlogged"
   mkdir -p "$(dirname "$PIPNN_GRAPH")"
   "$PY" - "$DATASET" "$PIPNN_TABLE" "$NUM_QUERIES" "$BENCH" <<'PY'
+import os
 import sys
 import time
+import numpy as np
 import psycopg
 sys.path.insert(0, sys.argv[4])
 import ann_bench, datasets
@@ -900,16 +905,40 @@ with psycopg.connect(ann_bench.DEFAULT_DSN, autocommit=True) as conn:
         print(f"{table} already loaded ({count} rows)")
         sys.exit(0)
     start = time.perf_counter()
-    conn.execute(f"CREATE UNLOGGED TABLE {table} (id int4 NOT NULL, embedding vector({ds.dim}) NOT NULL)")
+    # PIPNN_ORDER: a .npy of row ids, written in that order (each row keeps its
+    # id). The rows are gathered in arbitrary order, so the memory-mapped
+    # dataset is read into RAM first, sequentially.
+    order, train = None, ds.train
+    if os.environ.get("PIPNN_ORDER"):
+        order = np.load(os.environ["PIPNN_ORDER"])
+        if len(order) != len(ds.train) or not np.array_equal(np.sort(order), np.arange(len(ds.train))):
+            sys.exit(f"error: PIPNN_ORDER is not a permutation of the {len(ds.train)} row ids")
+        train = np.ascontiguousarray(ds.train)
+        print(f"loading in the order of {os.environ['PIPNN_ORDER']}")
+    space = os.environ.get("PIPNN_TABLESPACE")
+    if space and not conn.execute("SELECT 1 FROM pg_tablespace WHERE spcname = %s", (space,)).fetchone():
+        sys.exit(f"error: no tablespace {space}; CREATE TABLESPACE it first")
+    conn.execute(f"CREATE UNLOGGED TABLE {table} (id int4 NOT NULL, embedding vector({ds.dim}) NOT NULL)"
+                 + (f" TABLESPACE {ann_bench.ident(space)}" if space else ""))
     with conn.cursor() as cur, cur.copy(f"COPY {table} (id, embedding) FROM STDIN WITH (FORMAT BINARY)") as copy:
         copy.write(b"PGCOPY\n\xff\r\n\x00" + b"\x00" * 8)
-        for row in range(0, len(ds.train), 50_000):
-            copy.write(ann_bench.binary_copy_rows(ds.train[row : row + 50_000], row))
+        for row in range(0, len(train), 50_000):
+            if order is None:
+                copy.write(ann_bench.binary_copy_rows(train[row : row + 50_000], row))
+            else:
+                ids = order[row : row + 50_000]
+                copy.write(ann_bench.binary_copy_rows(train[ids], ids=ids))
         copy.write(b"\xff\xff")
     conn.execute(f"ANALYZE {table}")
     print(f"loaded {len(ds.train)} rows into {table} in {time.perf_counter() - start:.0f} s")
 PY
   "${PSQL[@]}" -c "ALTER TABLE $PIPNN_TABLE SET (autovacuum_enabled = false)"
+  # PIPNN_LOAD_ONLY=1 stops here, with the server up: for a graph file whose
+  # TIDs must first be rewritten for this table (pipnn_retid.py).
+  if [ "${PIPNN_LOAD_ONLY:-0}" = 1 ]; then
+    say "$PIPNN_TABLE loaded; stopping before the index (PIPNN_LOAD_ONLY)"
+    return 0
+  fi
 
   for d in ${PIPNN_DROP:-}; do
     [ "$d" != "$idx" ] || die "PIPNN_DROP names the index being built ($idx); use PIPNN_REBUILD"

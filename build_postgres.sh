@@ -62,8 +62,21 @@ fi
 
 # 2. Build and install Postgres. Meson also writes $BUILD/compile_commands.json,
 # which clangd finds for files under $SRC (pgvector uses ./compile_flags.txt)
+# PG_BLOCKSIZE=32 builds Postgres with 32 KB pages (meson's blocksize, in kB;
+# Postgres's default is 8). It is fixed when the build tree is set up: asking
+# an existing tree for another size is refused rather than switching it, since
+# a data directory only works with the page size it was created with. Leave it
+# unset to keep whatever the tree has.
 if [ ! -d "$BUILD" ]; then
-  meson setup "$BUILD" "$SRC" --prefix="$PREFIX" -Dicu=disabled
+  meson setup "$BUILD" "$SRC" --prefix="$PREFIX" -Dicu=disabled ${PG_BLOCKSIZE:+-Dblocksize=$PG_BLOCKSIZE}
+elif [ -n "${PG_BLOCKSIZE:-}" ]; then
+  have="$(meson introspect "$BUILD" --buildoptions |
+    python3 -c 'import json, sys; print(next(o["value"] for o in json.load(sys.stdin) if o["name"] == "blocksize"))')"
+  if [ "$have" != "$PG_BLOCKSIZE" ]; then
+    echo "error: $BUILD is set up for $have kB pages, not $PG_BLOCKSIZE." >&2
+    echo "       Use a separate checkout for another page size." >&2
+    exit 1
+  fi
 fi
 # Applied on every run so FRAME_POINTERS can be toggled; ninja rebuilds if it changed
 meson configure "$BUILD" -Dc_args="$FP_FLAGS"

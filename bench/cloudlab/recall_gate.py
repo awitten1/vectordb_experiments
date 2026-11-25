@@ -4,7 +4,7 @@ ef_search they share (within --tol). Used by hn_pipnn_stock.sh: stock pgvector
 and the pgvectorfast fork run the same float layer-0 search on the same
 imported graph, so their recall must agree.
 
-  recall_gate.py <label> <reference label> [--tol 0.002] [--results FILE]
+  recall_gate.py <label> <reference label> [--tol 0.002] [--results FILE] [--min-common 4]
 """
 import argparse
 import json
@@ -14,6 +14,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("label")
 ap.add_argument("ref")
 ap.add_argument("--tol", type=float, default=0.002)
+ap.add_argument("--min-common", type=int, default=4,
+                help="fewest shared ef_search values to accept (a smoke sweep has 3)")
 ap.add_argument("--results", default="bench/results/hackernews_minilm_384.jsonl")
 args = ap.parse_args()
 
@@ -28,7 +30,7 @@ def by_ef(label):
 
 a, b = by_ef(args.label), by_ef(args.ref)
 common = sorted(set(a) & set(b))
-if len(common) < 4:
+if len(common) < args.min_common:
     sys.exit(f"error: only {len(common)} ef_search values in common between {args.label} and {args.ref}")
 worst = 0.0
 for ef in common:

@@ -37,6 +37,7 @@ never has to fit in the client's address space as a live array, and exact
 neighbors are computed blockwise (see exact_neighbors).
 """
 
+import os
 import re
 import sys
 import urllib.request
@@ -561,7 +562,9 @@ def _hn_prepare() -> None:
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
-    parquet = DATA_DIR / "hackernews_part_1_of_1.parquet"
+    # HN_PARQUET (hn.env) can put the download on another disk; only this
+    # prep reads it.
+    parquet = Path(os.environ.get("HN_PARQUET") or DATA_DIR / "hackernews_part_1_of_1.parquet")
     if not parquet.exists():
         _download_resumable(HN_URL, parquet)
 

@@ -2,7 +2,8 @@
 # Start (or stop) the Postgres built by build_postgres.sh, with pgvector enabled.
 # Usage: ./run_postgres.sh [start|stop]
 # Data lives in ./postgres/data; logs go to ./postgres/data/log
-# Env: PGPORT (default 5432); PG_OPTS extra server options, e.g. PG_OPTS="-c shared_buffers=8GB";
+# Env: PGPORT (default 5432); PG_STOP_TIMEOUT seconds to wait for a stop (default 1800:
+#      the shutdown checkpoint of a freshly loaded table can take minutes); PG_OPTS extra server options, e.g. PG_OPTS="-c shared_buffers=8GB";
 #      NUMA_CMD a command prefix for the server, e.g. NUMA_CMD="numactl --interleave=all"
 #      (the postmaster and every backend inherit the memory policy)
 set -euo pipefail
@@ -38,7 +39,7 @@ case "${1:-start}" in
     ;;
   stop)
     if "$BIN/pg_ctl" -D "$DATA" status >/dev/null 2>&1; then
-      "$BIN/pg_ctl" -D "$DATA" -w stop
+      "$BIN/pg_ctl" -D "$DATA" -w -t "${PG_STOP_TIMEOUT:-1800}" stop
     else
       echo "Postgres is not running"
     fi

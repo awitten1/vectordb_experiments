@@ -332,10 +332,12 @@ def load_table(conn: psycopg.Connection, ds: datasets.Dataset, reload: bool) -> 
     log(f"loaded in {time.perf_counter() - start:.1f}s")
 
 
-def binary_copy_rows(vectors: np.ndarray, first_id: int) -> bytes:
+def binary_copy_rows(vectors: np.ndarray, first_id: int = 0, ids: np.ndarray | None = None) -> bytes:
     """Encode rows as COPY BINARY tuples (id int4, embedding vector) with numpy.
 
-    A vector's binary form is int16 dim, int16 unused, then dim big-endian float4s.
+    The ids are first_id, first_id + 1, ..., or `ids` (one per vector) when
+    given, e.g. to load rows in another order with their own ids. A vector's
+    binary form is int16 dim, int16 unused, then dim big-endian float4s.
     """
     n, d = vectors.shape
     row = np.dtype([
@@ -345,7 +347,12 @@ def binary_copy_rows(vectors: np.ndarray, first_id: int) -> bytes:
     rows = np.empty(n, dtype=row)
     rows["nfields"] = 2
     rows["id_len"] = 4
-    rows["id"] = np.arange(first_id, first_id + n)
+    if ids is None:
+        rows["id"] = np.arange(first_id, first_id + n)
+    else:
+        if len(ids) != n:
+            raise ValueError(f"{len(ids)} ids for {n} vectors")
+        rows["id"] = ids
     rows["vec_len"] = 4 + 4 * d
     rows["dim"] = d
     rows["unused"] = 0

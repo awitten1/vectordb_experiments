@@ -117,7 +117,7 @@ def main():
     print("|---|---:|---:|---:|---:|---:|---:|---:|" + ("---:|" if nic is not None else ""))
     fmt = lambda x: "–" if x is None else f"{x:.0%} ({x * 40:.1f} of 40)"
     for r, sb, cb, st, lk in sorted(out, key=lambda o: (o[0]["label"], o[0]["clients"], o[0]["search_value"])):
-        row = f"| {r['label']} | {r['clients']} | {r['search_value']} | {r['recall']:.4f} | {r['qps']:,.0f} | {fmt(sb)} | {fmt(cb)} | {'–' if st is None else f'{st} s'} |"
+        row = f"| {r['label']} | {r['clients']} | {r['search_value']} | {'–' if r['recall'] is None else format(r['recall'], '.4f')} | {r['qps']:,.0f} | {fmt(sb)} | {fmt(cb)} | {'–' if st is None else f'{st} s'} |"
         if nic is not None:
             row += (" – |" if lk is None else f" {lk[0]} / {lk[1]} |")
         print(row)
