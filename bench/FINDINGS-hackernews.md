@@ -1666,6 +1666,163 @@ every `ef_search`.
   so this is a cheap HNSW build. A stronger one (ef_construction 200) would
   take roughly 2–3× longer to build and may close some of the remaining gap.
 
+## The remaining gap on c220g5: PiPNN + tq4, 32 KB pages, reordered (measured)
+
+`bench/cloudlab/hn_g5_gap.sh` profiled the best Postgres arm and Ginger at
+equal width.
+- **The Postgres arm:** pgvectorfast + PiPNN + tq4 (ntq12 rerank) on 32 KB pages, in the reordered layout.
+- **Ginger:** the recommended config with THP.
+- **The widths:**
+  - 64 (recall@10 0.952 for both);
+  - 160 (0.986).
+
+Every run has a `gap_window.sh` window recording:
+- counters (topdown, cache and DRAM, uncore bandwidth);
+- call stacks;
+- `perf c2c` under load.
+
+`bench/cloudlab/gap_attrib.py` turns them into per-query costs. The full tables are in
+`bench/profiles/hn-gap/report.md`.
+
+The runs:
+- **Over the LAN:** Postgres as benchmarked, at 1, 40 and 60 clients.
+- **"In server":** pgbench on the server, one statement answering 100 queries, at 1 and 40 backends.
+- **Ginger:** in process, at 1 and 40 threads.
+
+All QPS matched the chart runs within 2%. **Work per query is equal:**
+
+| width | Postgres: hops, tq4 distances, reranked | Ginger: expansions, distances, reranked |
+|---:|---:|---:|
+| 64 | 72.9, 2,501, 64 | 72.8, 2,492, 60 |
+| 160 | 168.1, 5,133, 160 | 167.8, 5,114, 60 |
+
+**CPU µs per query at width 64**, split by sampled call stacks:
+
+| | Ginger, 1 thread | Postgres in server, 1 | Postgres over LAN, 1 | Ginger, 40 threads | Postgres in server, 40 | Postgres over LAN, 60 |
+|---|---:|---:|---:|---:|---:|---:|
+| rerank (12-bit distances, reads, sort) | 19 | 258 | 271 | 30 | 385 | 382 |
+| traversal (4-bit distances, lists, candidates) | 606 | 406 | 434 | 855 | 759 | 750 |
+| query encoding | 15 | 19 | 16 | 12 | 17 | 15 |
+| statement path: protocol, executor, kernel, other | 14 | 41 | 137 | 20 | 78 | 258 |
+| **CPU µs per query** | 655 | 724 | 858 | 917 | 1,239 | 1,405 |
+| busy CPUs of 40 | 1.0 | 1.0 | 0.9 | 40.0 | 40.0 | 37.1 |
+| QPS | 1,542 | 1,392 | 1,066 | 43,599 | 32,257 | 26,444 |
+
+**Ginger's 1.65× lead at full load** comes from three sources:
+- the rerank, +352 µs per query;
+- the statement path, +238 µs per query;
+- 2.9 idle CPUs (×1.08).
+
+Postgres's faster traversal takes 105 µs back. At 1 client, Ginger's lead is 1.45×:
+- rerank, +252 µs;
+- statement path, +123 µs of CPU, plus 80 µs off the server's CPU for the round trip;
+- traversal, −172 µs.
+
+1. **Rerank (the largest).** `HnswTqDistance4k` (`pgvectorfast_ntq/src/hnswtq.c:791`)
+   is a scalar loop over the 384 dimensions.
+   - **Cost:** 4.0 µs per candidate with its reads and the sort, against 0.32 µs for Ginger's AVX-512 `ExtraPrecisionScoring`.
+   - **Count:** Postgres reranks all ef candidates; Ginger reranks at most 6 × k = 60.
+   - **Share of CPU:** 27% at width 64 and 33% at 160.
+   - **Fix:** at Ginger's cost per candidate, a SIMD kernel would give about 35,000 QPS at width 64 over the LAN (+33%), and about 45,000 in server. A cap at 6 × k adds to that at large widths.
+2. **The client/server boundary.**
+   - **Per query:** about 240 µs of CPU at 60 clients: protocol and sockets, the kernel's TCP path, executor, catalog and lock-table lookups, memory contexts, the transaction. It is 78 µs when 100 queries share a statement.
+   - **Idle CPUs:** 60 clients leave 2.9 CPUs idle and 40 clients leave 15 idle (19,874 QPS).
+   - **Inherent:** most of this comes with a database server.
+3. **Traversal under load.** It is 1.49× faster than Ginger's on one thread, with prefetching and an AVX2 4-bit kernel at about 50 ns per neighbour. At 40 that lead falls to 1.13×.
+   - **Memory traffic:** Postgres moves 2.7× Ginger's DRAM bytes per query (1,431 against 525 KB) at 47–55 GB/s, against the 77 GB/s measured for reads.
+   - **Hyperthreading:** at IPC 1.69, a second hyperthread adds little. Ginger, stalled on memory 52% of cycles at IPC 0.71, gains from one.
+   - **What follows:** once the rerank is fixed, bandwidth becomes the limit, which argues for fewer bytes per neighbour (heap TIDs out of the element tuple).
+
+**Not bottlenecks:**
+- **Contention:** about 80 HITM loads per query over the LAN at 60 clients (lock manager hash table, scheduler, IOMMU), roughly 10 µs.
+- **Small costs:** Calico, heap fetch and executor are each under 10 µs.
+- **Query encoding:** about 15 µs in both engines.
+- **IOMMU:** NIC DMA mapping is under 1% of CPU.
+
+**Method notes.**
+- **Missing frame pointers:** `vectorfast.so` has none, so index time is attributed by leaf function.
+- **Sampler slowdown:** sampled windows ran a few % slower than the counter windows, so their shares are scaled to the counters' CPU per query.
+- **QPS for Postgres** comes from `xact_commit` over the 50 s of counter windows, read from `template1` so that the counting itself is not a benchmark transaction.
+- **Nodes:** Ginger ran on the client node and Postgres on the server node, which are identical.
+- **Report:** the artifact's "Why Ginger is still faster" section.
+
+## Rerank capped at 10 × k (measured)
+
+A new setting in pgvectorfast_ntq, `hnsw.rerank_limit`, caps how many candidates are re-scored:
+- **0** (the default) re-scores all of them, as before;
+- **N** re-scores only the nearest N by 4-bit distance, and the rest follow in 4-bit order.
+
+`bench/cloudlab/hn_g5_rr.sh` measured the reordered 32 KB arm with
+`hnsw.rerank_limit=100` (10 × k). The index was not rebuilt; only the server's library changed. Results are in `bench/profiles/hn-g5-rr/`, label `g5hp32kro-rr10-pgvectorfast-tq4`.
+
+- **Recall@10 is identical to four decimals** at every ef_search, including 160–1000 where the cap binds.
+- **QPS where it binds** (ef 160 / 320 / 640 / 1000): +15% / +40% / +63% / +75% at 1 client, and +8% / +18% / +24% / +28% at 60.
+- **At recall 0.99:** 417 → 530 QPS at 1 client and 9,890 → 11,172 at 60. Ginger's lead there drops from 1.42× to 1.12× and from 1.59× to 1.41×.
+- **Up to ef 80** (recall 0.95 included) the cap doesn't bind. Those points agree with the uncapped run within 3%, so the remaining lever at 0.95 is a faster 12-bit kernel.
+
+## A vector kernel for the 4+8 bit rerank (measured)
+
+`HnswTqDistance4k` in pgvectorfast_ntq now has AVX-512 and AVX2 kernels for 8 extra bits (`src/hnswtq.c`). Each step gathers each sub-code's centroid from the 8 KB codebook, flips its sign and does an FMA with the float query. The scalar loop stays as `HnswTqDistance4kScalar`, the reference.
+- **Setting:** `hnsw.rerank_kernel` (`auto` / `scalar` / `avx2` / `avx512`) picks the kernel and refuses one that isn't built.
+- **Self-test:** `tools/tq_check/tq_selftest.c` checks each kernel against the scalar loop, and its checksum is unchanged.
+- **Driver:** `bench/cloudlab/hn_g5_simd.sh`. The run kept the rerank cap at 100, and results are in `bench/profiles/hn-g5-simd/`.
+
+| | scalar | AVX2 | AVX-512 |
+|---|---:|---:|---:|
+| ns per distance (dimension 384, warm, one core) | 3,437 | 743 | 401 |
+| ef 64, 1 client (QPS, same session) | 1,073 | 1,360 | ≈1,434 |
+| ef 64, 60 clients | 26,476 | 30,286 | ≈29,036 |
+| ef 320, 60 clients | 8,940 | 9,299 | 9,269 |
+
+The AVX-512 values at ef 64 are interpolated from the sweep's neighbouring widths. Recall@10 is identical at every ef_search.
+
+**At matched recall**, the AVX-512 sweep against the scalar one, both capped:
+
+| | recall 0.90 | recall 0.95 | recall 0.99 |
+|---|---:|---:|---:|
+| 1 client | +21% | +32% (1,051 → 1,387) | +23% (530 → 650) |
+| 60 clients | +2% | +9% (25,809 → 28,010) | +8% (11,172 → 12,018) |
+
+- **Postgres overtakes Ginger at one client and recall 0.99**: 650 against Ginger's 594 QPS. At 0.95 Ginger leads 1.12× at one client and 1.57× under load.
+- **At 60 clients the gain falls well short of the profile's prediction (about +30%).**
+  - At ef 10, AVX-512 is 9% *slower* (55,567 → 50,715). The CPU per query there rises from 444 to 477 µs, although only 10 candidates are reranked.
+  - AVX2 matches AVX-512 under load.
+  - Likely cause, not yet measured: Skylake-SP's frequency licences for heavy 256- and 512-bit floating point slow the whole query on every core. cycles/ref-cycles per kernel would settle it.
+  - An all-integer kernel, as for the 4-bit traversal, would avoid it.
+
+## Low recall: the network card's socket and the scan lock (measured)
+
+At ef_search 10–40 the server was only 60–85% busy with 60 clients, and 90 clients didn't help (`hn_g5_c90.sh`).
+
+**The diagnosis** (`hn_g5_netdiag.sh`, with `net_diag.sh` on both nodes; analysis `net_attrib.py`; data in `bench/profiles/hn-netdiag/`) found two causes:
+- **One socket did all the work.** At ef 10, socket 0 was 19–20 of 20 CPUs busy and socket 1 only 3–8.
+  - The network card is attached to socket 0, and its 40 queue interrupts are pinned to CPUs 0–9 and 20–29 (irqbalance is off).
+  - Each query wakes its backend from that socket, and the scheduler keeps it there.
+- **Lock-manager contention.** Backends waited on `LWLock:LockManager` in 21% (60 clients) to 46% (90 clients) of `pg_stat_activity` samples.
+  - The scan takes a shared heavyweight page lock (`HNSW_SCAN_LOCK`, `hnswscan.c`) twice per query, for VACUUM's sake.
+  - Shared locks don't conflict, but a page lock can't use the fast path. Each acquire and each release is an exclusive pass through the same lock-table partition.
+
+**The network path has room.** `rtt` (the same statement with no search) reached 144k QPS at 60 clients and 179k at 90, with no drops or squeezes. The 90-client figure was limited by the client's own socket 0.
+
+**`hnsw.scan_lock`** (pgvectorfast_ntq; superuser; default on) skips the lock. It is for measurement only, because a concurrent VACUUM could then free elements a scan reads. Results of `hn_g5_nolock.sh` (`bench/profiles/hn-nolock/`), QPS with server busy:
+
+| ef | Ginger, 40 threads | 60 clients, lock on | 60 clients, lock off | 90 clients, lock on | 90 clients, lock off |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 147,169 | 50,782 (60%) | 48,585 (58%) | 53,441 (66%) | **74,495 (99%)** |
+| 20 | 99,124 | 45,215 (69%) | 44,896 (66%) | 44,767 (70%) | **58,464 (99%)** |
+| 40 | 61,724 | 36,677 (82%) | 37,766 (83%) | 34,743 (79%) | **41,132 (100%)** |
+| 80 | 37,021 | 25,017 (93%) | 25,297 (96%) | 23,940 (90%) | **26,259 (100%)** |
+| 160 | 21,913 | 15,388 (97%) | 15,653 (97%) | – | **16,105 (100%)** |
+
+- **60 clients without the lock:** no gain. The lock waits disappear, but socket 0 stays full (20.0 of 20) and the backends wait on their clients.
+- **90 clients with the lock:** no gain either; the extra clients queue on the lock.
+- **90 clients without the lock:** the server is 99–100% busy. That is +39% at ef 10, +31% at 20, +18% at 40 and +5–10% from 80 up.
+- **Ginger's lead** at ef 10 / 20 falls from 2.9× / 2.2× to 1.98× / 1.70×.
+- **What remains is CPU per query** (537 µs against Ginger's 272 at ef 10), mostly the statement path.
+- **Real fixes:**
+  - **The lock:** keep VACUUM's guarantee with a cheaper per-query mechanism, such as an LWLock per index in shared mode or a scan counter.
+  - **The socket:** spread the card's interrupts over both sockets.
+
 ## Measurement quality
 
 - **Repeatability between rounds of the same arm** (1 client, same `ef_search`):
@@ -1734,6 +1891,13 @@ for s in fourway fourway-hp; do for c in 1 40; do
 
 ## Open
 
+- A cheap replacement for the per-query `HNSW_SCAN_LOCK` page lock (shared LWLock
+  per index or a scan counter VACUUM waits on), and NIC interrupts spread over
+  both sockets ("Low recall: the network card's socket and the scan lock").
+- Whether the vector rerank kernels lower the clock under load (cycles against
+  ref-cycles at 60 clients per `hnsw.rerank_kernel`), and an integer 4+8-bit
+  kernel that avoids wide floating point ("A vector kernel for the 4+8 bit rerank").
+  Projected from the profiles at about +33% at recall 0.95 ("The remaining gap on c220g5").
 - What the ~14 lines per evaluated neighbour that leave the core are,
   against the ~7.4 an element tuple, its translation entry and its line
   pointer need. Count them by source (tuple, neighbour list, re-rank,
